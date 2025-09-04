@@ -2,17 +2,36 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Dash-Synced Audio Circles</title>
+<title>Dash-Synced Generative Audio Circles (Immediate Clear)</title>
 <style>
-html, body {margin:0;padding:0;width:100%;height:100%;background:#111;overflow:hidden;}
+html, body {margin:0;padding:0;width:100%;height:100%;background:#111;overflow:hidden;font-family:sans-serif;}
 svg {display:block;width:100%;height:100%;cursor:crosshair;}
 .ghost {fill:none;stroke:rgba(255,255,255,0.15);stroke-width:1.5;}
 .spinner {fill:none;stroke-width:8;transform-box:fill-box;transform-origin:center;}
-@keyframes spin {to{transform:rotate(360deg);}}
+@keyframes spin {to{transform:rotate(-360deg);}}
+#clearBtn {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    padding: 12px 20px;
+    font-size: 16px;
+    background: rgba(255,255,255,0.1);
+    color: #fff;
+    border: 2px solid #fff;
+    border-radius: 12px;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    transition: all 0.2s ease;
+}
+#clearBtn:hover {
+    background: rgba(255,255,255,0.25);
+    transform: scale(1.05);
+}
 </style>
 </head>
 <body>
 <svg id="canvas"></svg>
+<button id="clearBtn">Clear</button>
 <script>
 const svg = document.getElementById("canvas");
 const radius = 60;
@@ -25,6 +44,16 @@ let isSpaceDown = false;
 let segments = [];
 let rafId = null;
 const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+
+// ---------------- Seeded RNG ----------------
+function mulberry32(a) {
+    return function() {
+        let t = a += 0x6D2B79F5;
+        t = Math.imul(t ^ t >>> 15, t | 1);
+        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    }
+}
 
 // Random color generator
 function randomColor(){return `hsl(${Math.floor(Math.random()*360)},80%,55%)`;}
@@ -43,32 +72,50 @@ function buildDashArray(segments,liveType,liveDuration,totalDurationMs){
     return out.join(' ');
 }
 
-// Play a tone at an absolute AudioContext time
-function playToneAtTime(freq, pan, duration, modDepth, modRate, startTime){
-    const osc = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-    const panner = audioCtx.createStereoPanner();
-    osc.type = 'sine';
-    osc.frequency.value = freq;
-    gainNode.gain.value = 0.2;
-    panner.pan.value = pan;
-    osc.connect(gainNode); gainNode.connect(panner); panner.connect(audioCtx.destination);
+// ---------------- Rich Tone ----------------
+function playRichTone(freq, pan, duration, yFactor, startTime, rng, circle){
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.15 + yFactor*0.2;
+    const panner = new StereoPannerNode(audioCtx, {pan});
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 500 + yFactor*5000;
+    filter.connect(gain);
+    gain.connect(panner);
+    panner.connect(audioCtx.destination);
 
-    if(modDepth>0){
-        const lfo = audioCtx.createOscillator();
-        const lfoGain = audioCtx.createGain();
-        lfo.frequency.value = modRate;
-        lfoGain.gain.value = modDepth;
-        lfo.connect(lfoGain); lfoGain.connect(osc.frequency);
-        lfo.start(startTime);
-        osc.onended = ()=>lfo.stop();
-    }
-
-    osc.start(startTime);
-    osc.stop(startTime + duration);
+    const detunes = [0,5,-5];
+    detunes.forEach(d=>{
+        const osc = audioCtx.createOscillator();
+        const waveforms = ['sine','square','triangle','sawtooth'];
+        osc.type = waveforms[Math.floor(rng()*4)];
+        osc.frequency.value = freq * (0.95 + rng()*0.1);
+        osc.connect(filter);
+        osc.start(startTime);
+        osc.stop(startTime + duration);
+        circle._activeOscillators = circle._activeOscillators || [];
+        circle._activeOscillators.push(osc);
+    });
 }
 
-// Live preview tick
+// ---------------- Noise ----------------
+function playNoise(duration, pan, circle){
+    const bufferSize = audioCtx.sampleRate * duration;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for(let i=0;i<bufferSize;i++) data[i] = Math.random()*2-1;
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    const gainNode = audioCtx.createGain();
+    gainNode.gain.value = 0.05 + Math.random()*0.05;
+    const panner = new StereoPannerNode(audioCtx, {pan});
+    source.connect(gainNode); gainNode.connect(panner); panner.connect(audioCtx.destination);
+    source.start(audioCtx.currentTime);
+    circle._activeOscillators = circle._activeOscillators || [];
+    circle._activeOscillators.push(source);
+}
+
+// ---------------- Live preview ----------------
 function startLivePreview(){
     const tick = () => {
         if(!currentCircle) return;
@@ -78,56 +125,43 @@ function startLivePreview(){
         const dashArray=buildDashArray(segments,isSpaceDown?'dash':'gap',liveDuration,total);
         currentCircle.setAttribute('stroke-dasharray',dashArray);
         currentCircle.setAttribute('stroke-dashoffset',0.5);
-
-        // Play live tone if spacebar held
-        if(isSpaceDown && liveDuration>0){
-            const x=currentCircle._pos.x;
-            const y=currentCircle._pos.y;
-            const freq=220 + (x/window.innerWidth)*880 + (Math.random()*20-10);
-            const pan=(x/window.innerWidth)*2-1;
-            const modDepth=5 + (y/window.innerHeight)*20;
-            const modRate=2 + (y/window.innerHeight)*3;
-            playToneAtTime(freq, pan, 0.05, modDepth, modRate, audioCtx.currentTime);
-        }
-
         rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
 }
 
-// Dash-length-synced audio loop using absolute time
+// ---------------- Loop audio per circle ----------------
 function loopCircleAudio(circle){
     const rotationPeriod = 2;
-    const radius = parseFloat(circle.getAttribute('r'));
-    const circumference = 2 * Math.PI * radius;
+    const dashArray = circle.getAttribute('stroke-dasharray').split(' ').map(Number);
+    const totalLength = dashArray.reduce((a,b)=>a+b,0);
+    const segmentsLoop = dashArray.map((len,i)=>({type: i%2===0?'dash':'gap', length: len}));
+
+    const x = circle._pos.x;
+    const y = circle._pos.y;
+    const pan = (x/window.innerWidth)*2 - 1;
+    const yFactor = y/window.innerHeight;
+    const scale = [220,247,277,294,330,370,415,440];
 
     function scheduleLoopAhead(){
-        const dashArray = circle.getAttribute('stroke-dasharray').split(' ').map(Number);
-        const totalLength = dashArray.reduce((a,b)=>a+b,0);
-        const segments = dashArray.map((length,i)=>({type: i%2===0?'dash':'gap', length}));
-
         let t = audioCtx.currentTime + 0.05;
-        segments.forEach(seg=>{
+        segmentsLoop.forEach((seg)=>{
             const dur = (seg.length/totalLength)*rotationPeriod;
             if(seg.type==='dash' && dur>0){
-                const x = circle._pos.x;
-                const y = circle._pos.y;
-                const freq = 220 + (x/window.innerWidth)*880 + (Math.random()*20-10);
-                const pan = (x/window.innerWidth)*2-1;
-                const modDepth = 5 + (y/window.innerHeight)*20;
-                const modRate = 2 + (y/window.innerHeight)*3;
-                playToneAtTime(freq, pan, dur, modDepth, modRate, t);
+                const noteIndex = Math.floor(circle._rng()*scale.length);
+                const freq = scale[noteIndex]*(0.95 + circle._rng()*0.1);
+                playRichTone(freq, pan, dur, yFactor, t, circle._rng, circle);
+            } else if(seg.type==='gap' && dur>0.02){
+                // playNoise(dur, pan, circle);
             }
             t += dur;
         });
-
-        setTimeout(scheduleLoopAhead, (rotationPeriod-0.05)*1000);
+        circle._loopTimeout = setTimeout(scheduleLoopAhead, (rotationPeriod-0.05)*1000);
     }
-
     scheduleLoopAhead();
 }
 
-// Mouse events
+// ---------------- Mouse events ----------------
 svg.addEventListener("mousedown", e=>{
     const pt=svg.createSVGPoint(); pt.x=e.clientX; pt.y=e.clientY;
     const loc=pt.matrixTransform(svg.getScreenCTM().inverse());
@@ -142,9 +176,14 @@ svg.addEventListener("mousedown", e=>{
     currentCircle.setAttribute("cx",loc.x); currentCircle.setAttribute("cy",loc.y); currentCircle.setAttribute("r",radius);
     currentCircle.classList.add("spinner");
     currentCircle.style.stroke=randomColor();
-    currentCircle.setAttribute('stroke-dasharray', `0 ${circ}`); // start fully empty
+    currentCircle.setAttribute('stroke-dasharray', `0 ${circ}`);
     currentCircle.setAttribute('stroke-dashoffset',0.5);
     currentCircle._pos={x:loc.x,y:loc.y};
+
+    // Seeded RNG
+    const seed = Math.floor(loc.x*1000 + loc.y*1000 + performance.now());
+    currentCircle._rng = mulberry32(seed);
+
     svg.appendChild(currentCircle);
 
     holdStart=performance.now();
@@ -176,25 +215,80 @@ svg.addEventListener("mouseup", ()=>{
     lastSegmentStart=null;
 });
 
-// Spacebar events
+// ---------------- Spacebar events ----------------
 document.addEventListener("keydown", e=>{
     if(e.code==="Space" && currentCircle && !isSpaceDown){
         const now = performance.now();
         segments.push({type:'gap',duration:now-lastSegmentStart});
         lastSegmentStart=now;
         isSpaceDown=true;
+
+        // Start sustained note
+        const x = currentCircle._pos.x;
+        const y = currentCircle._pos.y;
+        const pan = (x/window.innerWidth)*2-1;
+        const yFactor = y/window.innerHeight;
+        const scale = [220,247,277,294,330,370,415,440];
+        const noteIndex = Math.floor(currentCircle._rng()*scale.length);
+        const freq = scale[noteIndex]*(0.95 + currentCircle._rng()*0.1);
+
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        gain.gain.value = 0.15 + yFactor*0.2;
+        const panner = new StereoPannerNode(audioCtx, {pan});
+        osc.type = ['sine','square','triangle','sawtooth'][Math.floor(currentCircle._rng()*4)];
+        osc.frequency.value = freq;
+
+        osc.connect(gain); gain.connect(panner); panner.connect(audioCtx.destination);
+        osc.start();
+        currentCircle._liveOsc = osc;
+
         e.preventDefault();
     }
 });
 
 document.addEventListener("keyup", e=>{
     if(e.code==="Space" && currentCircle && isSpaceDown){
-        const now=performance.now();
+        const now = performance.now();
         segments.push({type:'dash',duration:now-lastSegmentStart});
         lastSegmentStart=now;
         isSpaceDown=false;
+
+        if(currentCircle._liveOsc){
+            currentCircle._liveOsc.stop();
+            currentCircle._liveOsc.disconnect();
+            currentCircle._liveOsc = null;
+        }
         e.preventDefault();
     }
+});
+
+// ---------------- Clear button ----------------
+const clearBtn = document.getElementById('clearBtn');
+clearBtn.addEventListener('click', ()=>{
+    Array.from(svg.querySelectorAll('circle')).forEach(c=>{
+        // Stop live oscillator
+        if(c._liveOsc){
+            try { c._liveOsc.stop(); } catch(e){}
+            c._liveOsc.disconnect();
+            c._liveOsc = null;
+        }
+        // Stop all active oscillators mid-loop
+        if(c._activeOscillators){
+            c._activeOscillators.forEach(o=>{
+                try { o.stop(); } catch(e){}
+                o.disconnect();
+            });
+            c._activeOscillators = [];
+        }
+        // Stop loop timeouts
+        if(c._loopTimeout) {
+            clearTimeout(c._loopTimeout);
+            c._loopTimeout = null;
+        }
+        // Remove circle
+        c.remove();
+    });
 });
 </script>
 </body>
