@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Interactive Dash Painter (Default Start)</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      width: 100%;
+      background: #111;
+      overflow: hidden;
+    }
+    svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+    .ghost {
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.15);
+      stroke-width: 1.5;
+    }
+    .spinner {
+      fill: none;
+      stroke-width: 3;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <svg id="canvas"></svg>
+
+  <script>
+    const svg = document.getElementById("canvas");
+    const radius = 60;
+    const circ = 2 * Math.PI * radius;
+
+    let currentCircle = null;
+    let holdStart = null;
+    let lastSegmentStart = null;
+    let isSpaceDown = false;
+    let segments = [];
+    let rafId = null;
+
+    function randomColor() {
+      return `hsl(${Math.floor(Math.random() * 360)}, 80%, 55%)`;
+    }
+
+    function buildDashArray(segments, liveType, liveDuration, totalDurationMs) {
+      if (totalDurationMs <= 0) return `0 ${circ}`;
+      const scale = circ / totalDurationMs;
+
+      const all = segments.slice();
+      if (liveDuration > 0) {
+        all.push({ type: liveType, duration: liveDuration });
+      }
+
+      if (all.length === 0) return `0 ${circ}`;
+
+      const lens = all.map(s => Math.max(1, Math.round(s.duration * scale)));
+      const out = [];
+      if (all[0].type === 'gap') {
+        out.push(0, lens[0]);
+        for (let i = 1; i < lens.length; i++) out.push(lens[i]);
+      } else {
+        for (let i = 0; i < lens.length; i++) out.push(lens[i]);
+      }
+
+      return out.join(' ');
+    }
+
+    function startLivePreview() {
+      const tick = () => {
+        if (!currentCircle) return;
+        const now = performance.now();
+        const liveDuration = now - lastSegmentStart;
+        const total = now - holdStart;
+
+        const dashArray = buildDashArray(segments, isSpaceDown ? 'dash' : 'gap', liveDuration, total);
+        currentCircle.setAttribute('stroke-dasharray', dashArray);
+
+        rafId = requestAnimationFrame(tick);
+      };
+      rafId = requestAnimationFrame(tick);
+    }
+
+    svg.addEventListener("mousedown", (e) => {
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+
+      // Ghost outline
+      const ghost = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      ghost.setAttribute("cx", loc.x);
+      ghost.setAttribute("cy", loc.y);
+      ghost.setAttribute("r", radius);
+      ghost.classList.add("ghost");
+      svg.appendChild(ghost);
+
+      // Main spinner circle
+      currentCircle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      currentCircle.setAttribute("cx", loc.x);
+      currentCircle.setAttribute("cy", loc.y);
+      currentCircle.setAttribute("r", radius);
+      currentCircle.classList.add("spinner");
+      currentCircle.style.stroke = randomColor();
+
+      // Start completely empty
+      currentCircle.setAttribute("stroke-dasharray", `0 ${circ}`);
+
+      svg.appendChild(currentCircle);
+
+      holdStart = performance.now();
+      lastSegmentStart = holdStart;
+      segments = [];
+      isSpaceDown = false;
+
+      startLivePreview();
+    });
+
+    svg.addEventListener("mouseup", () => {
+      if (!currentCircle) return;
+      const now = performance.now();
+
+      segments.push({
+        type: isSpaceDown ? 'dash' : 'gap',
+        duration: now - lastSegmentStart
+      });
+
+      const total = now - holdStart;
+      const dashArray = buildDashArray(segments, null, 0, total);
+      currentCircle.setAttribute('stroke-dasharray', dashArray);
+
+      // Spin around its own center
+      currentCircle.style.animation = `spin 2s linear infinite`;
+
+      cancelAnimationFrame(rafId);
+      currentCircle = null;
+      segments = [];
+      isSpaceDown = false;
+      holdStart = null;
+      lastSegmentStart = null;
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Space" && currentCircle && !isSpaceDown) {
+        const now = performance.now();
+        segments.push({ type: 'gap', duration: now - lastSegmentStart });
+        lastSegmentStart = now;
+        isSpaceDown = true;
+        e.preventDefault();
+      }
+    });
+
+    document.addEventListener("keyup", (e) => {
+      if (e.code === "Space" && currentCircle && isSpaceDown) {
+        const now = performance.now();
+        segments.push({ type: 'dash', duration: now - lastSegmentStart });
+        lastSegmentStart = now;
+        isSpaceDown = false;
+        e.preventDefault();
+      }
+    });
+  </script>
+</body>
+</html>
