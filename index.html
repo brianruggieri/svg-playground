@@ -132,7 +132,7 @@ function startLivePreview(){
 
 // ---------------- Loop audio per circle ----------------
 function loopCircleAudio(circle){
-    const rotationPeriod = 2;
+    const rotationPeriod = circle._holdDuration / 1000; // seconds per full rotation
     const dashArray = circle.getAttribute('stroke-dasharray').split(' ').map(Number);
     const totalLength = dashArray.reduce((a,b)=>a+b,0);
     const segmentsLoop = dashArray.map((len,i)=>({type: i%2===0?'dash':'gap', length: len}));
@@ -201,7 +201,8 @@ svg.addEventListener("mouseup", ()=>{
     const dashArray=buildDashArray(segments,null,0,total);
     currentCircle.setAttribute('stroke-dasharray', dashArray);
     currentCircle.setAttribute('stroke-dashoffset',0.5);
-    currentCircle.style.animation='spin 2s linear infinite';
+    // Use hold duration to set spin speed
+    currentCircle.style.animation = `spin ${total/1000}s linear infinite`;
 
     currentCircle._segments=segments.slice();
     currentCircle._holdDuration=total;
