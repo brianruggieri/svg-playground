@@ -16,7 +16,7 @@ A single‑page SVG + Web Audio experiment that lets you “draw” rhythmic das
 
 ## How It Works (Architecture)
 
-The app is intentionally contained in one file, but the script is organized into focused sections:
+The app is split into ES modules, organized into focused areas:
 
 - **Geometry & State**
   - Tracks `segments` (dash/gap durations) while the mouse is held.
@@ -51,7 +51,12 @@ The app is intentionally contained in one file, but the script is organized into
 
 ## File Layout
 
-- `index.html` — Everything: markup, styles, and logic.
+- `index.html` — Markup, styles, and module entrypoint.
+- `js/app.js` — App wiring (events, preview, state).
+- `js/audio.js` — Audio engine (live + loop playback).
+- `js/utils.js` — Helpers (analysis, dasharray, RNG).
+- `js/constants.js` — Shared constants and scales.
+- `js/circles.js` — Circle creation and SVG setup.
 - `README.md` — This file.
 
 ## Notes & Tips
@@ -61,6 +66,34 @@ The app is intentionally contained in one file, but the script is organized into
   - Adjust the `SCALES` list.
   - Tweak `LIVE_AUDIO_FADE_SEC` or filter parameters.
 - For larger refactors, consider extracting the audio engine into a dedicated module.
+
+## Dev Server
+
+This project now uses Vite as the recommended development server for native ES module workflows (fast start, HMR, and an optimized production build).
+
+- Install dependencies (Node >= 20.17.0 is recommended):
+```
+npm install
+```
+
+- Start the Vite dev server:
+```
+npm run dev
+```
+By default Vite listens on port 5173; to override the port set the PORT environment variable:
+```
+PORT=3000 npm run dev
+```
+
+- Build production assets:
+```
+npm run build
+```
+
+- Preview the production build locally:
+```
+npm run preview
+```
 
 ## License
 

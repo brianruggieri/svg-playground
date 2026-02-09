@@ -1,0 +1,24 @@
+{
+  "name": "svg-playground",
+  "version": "0.1.0",
+  "description": "Dash‑Synced Generative Audio Circles — small ES module demo with Vite-powered dev & build",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [
+    "svg",
+    "web-audio",
+    "generative",
+    "demo"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "vite": "^5.4.21"
+  },
+  "engines": {
+    "node": ">=20.17.0"
+  }
+}
