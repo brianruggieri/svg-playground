@@ -27,8 +27,9 @@ import {
   createLiveAudio,
   fadeAndCleanupLiveAudio,
   loopCircleAudio,
+  playClickTone,
 } from './audio';
-import { createCircleAt } from './circles';
+import { createCircleAt, emotionalExit } from './circles';
 import {
   setSegments,
   setHoldDuration,
@@ -88,6 +89,13 @@ export function init(
 
   const audioCtx = options.audioCtx ?? createAudioContext();
 
+  // Debug window typing for filter compensation UI.
+  // This gives us a typed handle instead of repeatedly casting `window as any`.
+  interface WindowWithDebug extends Window {
+    __FILTER_COMPENSATION_SENSITIVITY?: number;
+  }
+  const debugWindow = window as unknown as WindowWithDebug;
+
   // Instance local state
   let currentCircle: SVGCircleElement | null = null;
   let holdStart: number | null = null;
@@ -98,6 +106,276 @@ export function init(
 
   // Keep small registry for cleanup if needed
   const trackedCircles = new Set<SVGCircleElement>();
+  // Gate for immediate click tone feedback. Set to true to enable per-pointerdown click tone.
+  const ENABLE_CLICK_TONE = false;
+
+  // Debug overlay state: map circles -> overlay elements
+  let debugMode = false;
+  const overlayMap = new Map<SVGCircleElement, HTMLElement>();
+  let debugRaf: number | null = null;
+
+  // Create a simple overlay element showing freq/gain/pan and stick it to the circle.
+  function createOverlayForCircle(
+    circle: SVGCircleElement,
+    clientX: number,
+    clientY: number,
+    info: {
+      freq: number;
+      gain: number;
+      pan: number;
+      filterFreq?: number;
+      filterClamped?: boolean;
+    }
+  ): HTMLElement {
+    // If an overlay already exists for this circle, update text and return it.
+    const existing = overlayMap.get(circle);
+    const filterLine =
+      typeof info.filterFreq === 'number'
+        ? `filter: ${info.filterFreq.toFixed(1)}Hz${
+            info.filterClamped ? ' (clamped)' : ''
+          }`
+        : '';
+    if (existing) {
+      try {
+        // If overlay was created with structured children, update the info block;
+        // otherwise fall back to overwriting textContent.
+        const infoEl = existing.querySelector('.overlay-info');
+        if (infoEl) {
+          infoEl.textContent = `freq: ${info.freq.toFixed(1)}Hz\ngain: ${info.gain.toFixed(
+            3
+          )}\npan: ${info.pan.toFixed(2)}${filterLine ? '\n' + filterLine : ''}`;
+        } else {
+          existing.textContent = `freq: ${info.freq.toFixed(1)}Hz\ngain: ${info.gain.toFixed(
+            3
+          )}\npan: ${info.pan.toFixed(2)}${filterLine ? '\n' + filterLine : ''}`;
+        }
+        // Update the compensation label if present
+        const compLabel = existing.querySelector('.comp-label');
+        const globalVal = debugWindow.__FILTER_COMPENSATION_SENSITIVITY ?? 1.0;
+        if (compLabel)
+          compLabel.textContent = `comp: ${Number(globalVal).toFixed(2)}`;
+      } catch {
+        existing.textContent = `freq: ${info.freq.toFixed(1)}Hz\ngain: ${info.gain.toFixed(
+          3
+        )}\npan: ${info.pan.toFixed(2)}${filterLine ? '\n' + filterLine : ''}`;
+      }
+      return existing;
+    }
+
+    const el = document.createElement('div');
+    el.className = 'debug-overlay';
+    // allow pointer events for controls (slider) while keeping text selection behavior reasonable
+    el.style.position = 'absolute';
+    el.style.pointerEvents = 'auto';
+    el.style.whiteSpace = 'normal';
+    el.style.fontFamily = 'monospace';
+    el.style.fontSize = '12px';
+    el.style.padding = '6px 8px';
+    el.style.background = 'rgba(0,0,0,0.85)';
+    el.style.color = 'white';
+    el.style.borderRadius = '6px';
+    el.style.transform = 'translate(-50%, -140%)';
+    el.style.zIndex = '9999';
+    el.style.minWidth = '120px';
+    el.style.boxSizing = 'border-box';
+    // Info block (read-only, updated per-frame)
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'overlay-info';
+    infoDiv.style.whiteSpace = 'pre';
+    infoDiv.style.pointerEvents = 'none';
+    infoDiv.textContent = `freq: ${info.freq.toFixed(1)}Hz\ngain: ${info.gain.toFixed(
+      3
+    )}\npan: ${info.pan.toFixed(2)}${filterLine ? '\n' + filterLine : ''}`;
+    // Controls (slider) - hidden by default visually compact; visible in debug overlay
+    const controls = document.createElement('div');
+    controls.className = 'overlay-controls';
+    controls.style.marginTop = '6px';
+    controls.style.display = 'flex';
+    controls.style.alignItems = 'center';
+    controls.style.gap = '8px';
+    controls.style.pointerEvents = 'auto';
+    // slider
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '1.0';
+    slider.max = '3.0';
+    slider.step = '0.01';
+    slider.className = 'comp-slider';
+    // initialize global if missing
+    if (debugWindow.__FILTER_COMPENSATION_SENSITIVITY == null) {
+      debugWindow.__FILTER_COMPENSATION_SENSITIVITY = 1.0;
+    }
+    slider.value = String(debugWindow.__FILTER_COMPENSATION_SENSITIVITY ?? 1.0);
+    slider.style.width = '88px';
+    slider.style.verticalAlign = 'middle';
+    // label showing current value
+    const label = document.createElement('span');
+    label.className = 'comp-label';
+    label.style.fontSize = '11px';
+    label.style.opacity = '0.95';
+    label.textContent = `comp: ${Number(slider.value).toFixed(2)}`;
+    // wire slider updates to global window var for immediate access by audio code
+    slider.addEventListener('input', () => {
+      try {
+        const v = Number(slider.value) || 1.0;
+        debugWindow.__FILTER_COMPENSATION_SENSITIVITY = v;
+        label.textContent = `comp: ${v.toFixed(2)}`;
+      } catch {
+        /* ignore event errors */
+      }
+    });
+    // Assemble overlay
+    controls.appendChild(slider);
+    controls.appendChild(label);
+    el.appendChild(infoDiv);
+    el.appendChild(controls);
+    document.body.appendChild(el);
+    overlayMap.set(circle, el);
+    // Position immediately
+    try {
+      const r = circle.getBoundingClientRect();
+      el.style.left = `${r.left + r.width / 2}px`;
+      el.style.top = `${r.top + r.height / 2}px`;
+    } catch {
+      // fallback to client coords if DOM geometry not available
+      el.style.left = `${clientX}px`;
+      el.style.top = `${clientY}px`;
+    }
+    return el;
+  }
+
+  function removeOverlayForCircle(circle: SVGCircleElement) {
+    const el = overlayMap.get(circle);
+    if (!el) return;
+    try {
+      el.remove();
+    } catch {
+      // ignore
+    }
+    overlayMap.delete(circle);
+  }
+
+  function updateAllOverlays() {
+    for (const [circle, el] of overlayMap.entries()) {
+      try {
+        const r = circle.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        el.style.left = `${cx}px`;
+        el.style.top = `${r.top + r.height / 2}px`;
+
+        // recompute mapping values each frame to reflect live changes
+        try {
+          const pan = Math.max(
+            -1,
+            Math.min(1, (cx / Math.max(1, window.innerWidth)) * 2 - 1)
+          );
+          const yNorm = Math.max(
+            0,
+            Math.min(1, cy / Math.max(1, window.innerHeight))
+          );
+          const yFactor = 1 - yNorm;
+          const freq = 220 * Math.pow(880 / 220, yFactor);
+          const gain = Math.max(0.01, 0.06 + yFactor * 0.18);
+
+          // compute filter frequency / clamping consistent with audio mapping
+          const sr = (audioCtx && audioCtx.sampleRate) || 44100;
+          const minFilter = Math.max(40, sr * 0.001);
+          const rawFilter = 500 + pan * 2000 + yFactor * 3000;
+          const filterFreq = Math.max(minFilter, rawFilter);
+          const filterClamped =
+            rawFilter < minFilter ||
+            circle.getAttribute('data-pan-clamped') === '1';
+
+          // Update structured overlay children if present to avoid stomping controls
+          const infoEl = el.querySelector('.overlay-info');
+          if (infoEl) {
+            infoEl.textContent = `freq: ${freq.toFixed(1)}Hz\ngain: ${gain.toFixed(
+              3
+            )}\npan: ${pan.toFixed(2)}\nfilter: ${filterFreq.toFixed(1)}Hz${filterClamped ? ' (clamped)' : ''}`;
+          } else {
+            el.textContent = `freq: ${freq.toFixed(1)}Hz\ngain: ${gain.toFixed(
+              3
+            )}\npan: ${pan.toFixed(2)}\nfilter: ${filterFreq.toFixed(1)}Hz${filterClamped ? ' (clamped)' : ''}`;
+          }
+          // Update compensation label if present
+          try {
+            const compLabel = el.querySelector('.comp-label');
+            const globalVal =
+              debugWindow.__FILTER_COMPENSATION_SENSITIVITY ?? 1.0;
+            if (compLabel)
+              compLabel.textContent = `comp: ${Number(globalVal).toFixed(2)}`;
+          } catch {
+            // ignore label update failures
+          }
+        } catch {
+          // ignore value-computation errors for overlays
+        }
+      } catch {
+        // ignore geometry errors
+      }
+    }
+    debugRaf = debugMode ? requestAnimationFrame(updateAllOverlays) : null;
+  }
+
+  function setDebugMode(on: boolean) {
+    debugMode = on;
+    if (!debugMode) {
+      // remove overlays
+      for (const c of Array.from(overlayMap.keys())) {
+        removeOverlayForCircle(c);
+      }
+      if (debugRaf) {
+        cancelAnimationFrame(debugRaf);
+        debugRaf = null;
+      }
+    } else {
+      // create overlays for existing tracked circles with placeholder info
+      for (const c of trackedCircles) {
+        // compute approximate values from circle center
+        const r = c.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        const pan = Math.max(
+          -1,
+          Math.min(1, (cx / Math.max(1, window.innerWidth)) * 2 - 1)
+        );
+        const yNorm = Math.max(
+          0,
+          Math.min(1, cy / Math.max(1, window.innerHeight))
+        );
+        const yFactor = 1 - yNorm;
+        const freq = 220 * Math.pow(880 / 220, yFactor);
+        const gain = Math.max(0.01, 0.06 + yFactor * 0.18);
+        // compute filter frequency using the same formula as audio; use audioCtx sampleRate to determine min
+        try {
+          const sr = (audioCtx && audioCtx.sampleRate) || 44100;
+          const minFilter = Math.max(40, sr * 0.001);
+          const rawFilter = 500 + pan * 2000 + yFactor * 3000;
+          const filterFreq = Math.max(minFilter, rawFilter);
+          const filterClamped = rawFilter < minFilter;
+          createOverlayForCircle(c, cx, cy, {
+            freq,
+            gain,
+            pan,
+            filterFreq,
+            filterClamped,
+          });
+        } catch {
+          createOverlayForCircle(c, cx, cy, { freq, gain, pan });
+        }
+      }
+      // kick off RAF to keep overlays positioned
+      if (!debugRaf) updateAllOverlays();
+    }
+  }
+
+  // Toggle debug overlay with the 'D' key (case-insensitive)
+  document.addEventListener('keydown', (ev) => {
+    if (ev.code === 'KeyD') {
+      setDebugMode(!debugMode);
+    }
+  });
 
   // Ensure audio starts on first user gesture (some browsers require resume)
   function ensureAudioStarted() {
@@ -149,6 +427,44 @@ export function init(
     // Fade and cleanup any live audio nodes
     fadeAndCleanupLiveAudio(audioCtx, currentCircle);
 
+    // If the recorded segments contain no 'dash' entries (i.e. no beats),
+    // animate the circle out with an emotional exit and cleanup instead of abrupt removal.
+    const hasDash = segments.some((s) => s.type === 'dash' && s.duration > 0);
+    if (!hasDash) {
+      try {
+        // Trigger a visible emotional exit animation (shrink + fade).
+        // `emotionalExit` will attempt to clear state and remove the SVG elements.
+        emotionalExit(currentCircle);
+      } catch {
+        // ignore animation errors
+      }
+      try {
+        // Remove any debug overlay for this circle (overlay is separate from SVG)
+        removeOverlayForCircle(currentCircle);
+      } catch {
+        // ignore
+      }
+      try {
+        // Ensure we do not track this circle for cleanup
+        trackedCircles.delete(currentCircle);
+      } catch {
+        // ignore
+      }
+
+      // reset hold state
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      currentCircle = null;
+      segments = [];
+      isSpaceDown = false;
+      holdStart = null;
+      lastSegmentStart = null;
+      return;
+    }
+
+    // If we have dashes, proceed to set up visible loop and audio
     currentCircle.setAttribute('stroke-dasharray', dashArray);
     currentCircle.setAttribute('stroke-dashoffset', '0.5');
     currentCircle.style.animation = `spin ${total / 1000}s linear infinite`;
@@ -222,6 +538,57 @@ export function init(
     const created = createCircleAt(svgEl, loc);
     // Type assert into SVGCircleElement
     currentCircle = created as SVGCircleElement;
+
+    // Immediate audible feedback for the click position (guarded)
+    try {
+      if (ENABLE_CLICK_TONE) {
+        playClickTone(audioCtx, e.clientX, e.clientY);
+      }
+    } catch {
+      /* ignore audio errors on constrained platforms */
+    }
+
+    // Also create a debug overlay (if debug mode enabled) and attach it to the new circle.
+    try {
+      // compute pan/yFactor and sample gain/freq similar to audio mapping
+      const pan = Math.max(
+        -1,
+        Math.min(1, (loc.x / Math.max(1, window.innerWidth)) * 2 - 1)
+      );
+      const yNorm = Math.max(
+        0,
+        Math.min(1, loc.y / Math.max(1, window.innerHeight))
+      );
+      const yFactor = 1 - yNorm;
+      const freq = 220 * Math.pow(880 / 220, yFactor);
+      const gain = Math.max(0.01, 0.06 + yFactor * 0.18);
+      if (debugMode && currentCircle) {
+        try {
+          const sr = (audioCtx && audioCtx.sampleRate) || 44100;
+          const minFilter = Math.max(40, sr * 0.001);
+          const rawFilter = 500 + pan * 2000 + yFactor * 3000;
+          const filterFreq = Math.max(minFilter, rawFilter);
+          const filterClamped =
+            rawFilter < minFilter ||
+            currentCircle.getAttribute('data-pan-clamped') === '1';
+          createOverlayForCircle(currentCircle, e.clientX, e.clientY, {
+            freq,
+            gain,
+            pan,
+            filterFreq,
+            filterClamped,
+          });
+        } catch {
+          createOverlayForCircle(currentCircle, e.clientX, e.clientY, {
+            freq,
+            gain,
+            pan,
+          });
+        }
+      }
+    } catch {
+      // ignore overlay failures
+    }
 
     holdStart = performance.now();
     lastSegmentStart = holdStart;
@@ -393,8 +760,32 @@ export function init(
       } catch (err) {
         // ignore
       }
+      // Remove any per-circle debug overlay if present
+      try {
+        removeOverlayForCircle(c);
+      } catch {
+        // ignore
+      }
     }
     trackedCircles.clear();
+
+    // Ensure debug overlays cleared and RAF stopped
+    try {
+      for (const el of Array.from(overlayMap.values())) {
+        try {
+          el.remove();
+        } catch {
+          /* ignore */
+        }
+      }
+      overlayMap.clear();
+      if (debugRaf) {
+        cancelAnimationFrame(debugRaf);
+        debugRaf = null;
+      }
+    } catch {
+      // ignore
+    }
   }
 
   return {

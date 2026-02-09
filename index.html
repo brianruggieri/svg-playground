@@ -1,79 +1,672 @@
 <!doctype html>
 <html lang="en">
-    <head>
-        <meta charset="UTF-8" />
-        <title>Dash‑Synced Generative Audio Circles</title>
-        <style>
-            :root {
-                color-scheme: dark;
+  <head>
+    <meta charset="UTF-8" />
+    <title>Dash‑Synced Generative Audio Circles</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #111;
+        overflow: hidden;
+        font-family: sans-serif;
+      }
+      svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+        cursor: crosshair;
+      }
+      .ghost {
+        fill: none;
+        stroke: rgba(255, 255, 255, 0.15);
+        stroke-width: 1.5;
+      }
+      .spinner {
+        fill: none;
+        stroke-width: 8;
+        transform-box: fill-box;
+        transform-origin: center;
+        /* subtle transition for non-transform visual emphasis (avoid using transform here so spin animation isn't overridden) */
+        transition:
+          stroke-width 120ms ease-out,
+          filter 120ms ease-out;
+      }
+      .spinner.emphasized {
+        /* visual emphasis without touching transform so the spin animation keeps rotating */
+        stroke-width: 12;
+      }
+
+      /* Glow ring that visually echoes a note being played.
+               The glow is implemented via an SVG filter (defined in the canvas)
+               and a short "playing" animation that briefly increases opacity/scale. */
+      .glow-ring {
+        fill: none;
+        stroke-opacity: 0.9;
+        stroke-width: 14;
+        transform-box: fill-box;
+        transform-origin: center;
+        pointer-events: none; /* purely decorative */
+        opacity: 0;
+        transition:
+          opacity 160ms ease-out,
+          transform 180ms cubic-bezier(0.22, 0.9, 0.35, 1);
+        /* the filter reference is set on the element via the SVG `filter` attribute */
+      }
+
+      /* When a circle is in the "playing" state we flash the glow ring */
+      .glow-ring.playing {
+        opacity: 1;
+        transform: scale(1.08);
+      }
+
+      /* provide a slightly more pronounced outer halo on play */
+      .glow-ring.playing {
+        stroke-opacity: 0.95;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(-360deg);
+        }
+      }
+
+      #clearBtn {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        padding: 12px 20px;
+        font-size: 16px;
+        background: rgba(255, 255, 255, 0.1);
+        color: #fff;
+        border: 2px solid #fff;
+        border-radius: 12px;
+        cursor: pointer;
+        backdrop-filter: blur(6px);
+        transition: all 0.2s ease;
+      }
+      #clearBtn:hover {
+        background: rgba(255, 255, 255, 0.25);
+        transform: scale(1.05);
+      }
+    </style>
+  </head>
+  <body>
+    <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
+      <!-- Shared defs for visual effects (glow filter used by glow-ring elements). -->
+      <defs>
+        <filter
+          id="glow"
+          x="-75%"
+          y="-75%"
+          width="250%"
+          height="250%"
+          color-interpolation-filters="sRGB"
+        >
+          <!-- Blur then boost the color intensity for a soft halo -->
+          <feGaussianBlur stdDeviation="6" result="b" />
+          <feColorMatrix
+            in="b"
+            type="matrix"
+            values="1 0 0 0 0
+                                0 1 0 0 0
+                                0 0 1 0 0
+                                0 0 0 0.9 0"
+            result="c"
+          />
+          <feMerge>
+            <feMergeNode in="c" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+
+      <!-- Group dedicated to rendering glow rings behind the main spinners.
+                 Glow rings are kept here so their z-order is consistent. -->
+      <g id="glow-layer" aria-hidden="true"></g>
+    </svg>
+    <button id="clearBtn">Clear</button>
+
+    <script type="module">
+      import { init } from './js/app.ts';
+      // Mount into the body. If you want a different container, pass a selector or element.
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () =>
+          init(document.body)
+        );
+      } else {
+        init(document.body);
+      }
+    </script>
+
+    <!-- Small visual glue: create and manage glow rings for spinner circles, and
+             trigger a short glow flash when we detect note-related activity.
+             This is intentionally non-invasive: it listens for DOM changes and a
+             custom event `svg-playground:note` (developers can dispatch this from audio code
+             with `document.dispatchEvent(new CustomEvent('svg-playground:note', { detail: { circleId: 'c-...' } }))`).
+        -->
+    <script type="module">
+      // Global debug/config for glow behavior (adjustable via the debug panel)
+      const __GLOW_CONFIG = {
+        blur: 6, // feGaussianBlur stdDeviation
+        opacityMultiplier: 1.0, // multiply computed intensity
+        scaleMultiplier: 1.0, // multiply computed scale
+        minOpacity: 0.06,
+        maxOpacity: 1.0,
+        minScale: 0.9,
+        maxScale: 1.4,
+        pulseEnabled: true,
+        pulseDuration: 360, // ms
+      };
+
+      // Lightweight helper to create a glow-ring for a spinner circle.
+      function createOrSyncGlow(circle) {
+        const svg = document.getElementById('canvas');
+        if (!svg) return null;
+        const id = circle.getAttribute('data-circle-id');
+        if (!id) return null;
+
+        // Ensure a glow-layer exists
+        let glowLayer = svg.querySelector('#glow-layer');
+        if (!glowLayer) {
+          glowLayer = document.createElementNS(
+            'http://www.w3.org/2000/svg',
+            'g'
+          );
+          glowLayer.setAttribute('id', 'glow-layer');
+          svg.appendChild(glowLayer);
+        }
+
+        // Look for existing ring
+        let ring = glowLayer.querySelector(
+          `.glow-ring[data-circle-id="${id}"]`
+        );
+        if (!ring) {
+          ring = document.createElementNS(
+            'http://www.w3.org/2000/svg',
+            'circle'
+          );
+          ring.classList.add('glow-ring');
+          ring.setAttribute('data-circle-id', id);
+          // Put ring into the glow layer
+          glowLayer.appendChild(ring);
+        }
+
+        // Mirror position/size/color from the spinner as best-effort
+        try {
+          const cx = circle.getAttribute('cx');
+          const cy = circle.getAttribute('cy');
+          const r = circle.getAttribute('r');
+          ring.setAttribute('cx', cx ?? '0');
+          ring.setAttribute('cy', cy ?? '0');
+          ring.setAttribute('r', r ?? '0');
+
+          // Attempt to copy stroke color from inline style first, fallback to attribute or computed style.
+          let strokeColor = circle.getAttribute('stroke') || '';
+          if (!strokeColor) {
+            const style = circle.style && circle.style.stroke;
+            if (style) strokeColor = style;
+          }
+          if (!strokeColor) {
+            const cs = window.getComputedStyle(circle);
+            strokeColor = cs ? cs.stroke || cs.getPropertyValue('stroke') : '';
+          }
+          if (!strokeColor) strokeColor = '#fff';
+
+          ring.setAttribute('stroke', strokeColor);
+          // apply the glow filter to the ring
+          ring.setAttribute('filter', 'url(#glow)');
+          // ensure ring has a transition style for smooth updates
+          ring.style.transition =
+            'opacity 140ms ease-out, transform 180ms cubic-bezier(.22,.9,.35,1)';
+          ring.style.opacity = '0';
+          ring.style.transform = 'scale(1)';
+        } catch (err) {
+          // best-effort; don't break the page if something goes wrong
+        }
+
+        return ring;
+      }
+
+      // compute a simple amplitude proxy from note properties (duration & frequency)
+      function computeAmplitudeFromNote(detail) {
+        // If the audio already provides an explicit intensity, use it
+        if (detail && typeof detail.intensity === 'number') {
+          return Math.max(0, detail.intensity);
+        }
+        // Fallback heuristic:
+        // - longer durations -> stronger amplitude (but saturate)
+        // - higher frequency adds slight brightness factor
+        const dur = Math.max(0.001, Number(detail && detail.duration) || 0.05);
+        const freq = Math.max(20, Number(detail && detail.freq) || 440);
+        // map duration (s) using a gentle sigmoid-like mapping
+        const dFactor = Math.tanh(dur * 2.5); // 0..~1
+        const fFactor = Math.min(1, Math.log2(freq / 55) / 6); // rough 0..1 for 55Hz..3520Hz
+        // combine with weighting (duration primary)
+        const amp = 0.65 * dFactor + 0.35 * fFactor;
+        return Math.max(0, Math.min(1, amp));
+      }
+
+      // Apply config -> DOM for filter blur
+      function applyGlobalGlowConfigToFilter() {
+        try {
+          const g = document.querySelector('#glow feGaussianBlur');
+          if (g) g.setAttribute('stdDeviation', String(__GLOW_CONFIG.blur));
+        } catch {}
+      }
+
+      // Flash the glow for a short duration on the provided spinner element.
+      // Accepts opts.detail which may come from the audio event.
+      function flashGlowFor(circle, opts = {}) {
+        const ring = createOrSyncGlow(circle);
+        if (!ring) return;
+        const duration =
+          typeof opts.duration === 'number'
+            ? opts.duration
+            : __GLOW_CONFIG.pulseEnabled
+              ? __GLOW_CONFIG.pulseDuration
+              : 180;
+
+        // Determine amplitude (0..1)
+        const amplitude = computeAmplitudeFromNote(opts.detail || opts);
+        // Map amplitude to opacity and scale using global multipliers/clamps
+        const baseOpacity = Math.max(
+          __GLOW_CONFIG.minOpacity,
+          Math.min(
+            __GLOW_CONFIG.maxOpacity,
+            amplitude * __GLOW_CONFIG.opacityMultiplier
+          )
+        );
+        const baseScale = Math.max(
+          __GLOW_CONFIG.minScale,
+          Math.min(
+            __GLOW_CONFIG.maxScale,
+            1 + amplitude * (0.25 * __GLOW_CONFIG.scaleMultiplier)
+          )
+        );
+
+        // apply visual properties directly so the flash matches amplitude
+        try {
+          ring.style.opacity = String(baseOpacity);
+          ring.style.transform = `scale(${baseScale})`;
+        } catch {}
+
+        // If the spinner itself benefits from a small emphasis, apply it too.
+        try {
+          // Apply a CSS class for emphasis instead of changing `transform` inline
+          // (inline transform conflicts with the rotation animation). This keeps
+          // the spinner rotating while still providing a visible emphasis.
+          circle.classList.add('emphasized');
+        } catch {}
+
+        // Add playing class if pulse animation is enabled (keeps original pulse behavior)
+        if (__GLOW_CONFIG.pulseEnabled) {
+          ring.classList.add('playing');
+          // emphasize spinner visually without touching its transform so rotation continues
+          circle.classList.add('emphasized');
+        }
+
+        // Clear pending timer if one exists (store on DOM dataset)
+        const key = '__glow_timer';
+        const prev = ring[key];
+        if (typeof prev === 'number') {
+          clearTimeout(prev);
+        }
+
+        // Restore to a subtle tail instead of completely removing immediately
+        const tid = window.setTimeout(
+          () => {
+            try {
+              // soft fade back to zero; keep a tiny residual to avoid abrupt pop
+              ring.style.opacity = '0';
+              ring.style.transform = 'scale(1)';
+              // remove any transient emphasized class so we don't rely on inline transforms
+              try {
+                circle.classList.remove('emphasized');
+              } catch {}
+              if (__GLOW_CONFIG.pulseEnabled) {
+                ring.classList.remove('playing');
+                circle.classList.remove('emphasized');
+              }
+            } catch {
+              /* ignore */
+            } finally {
+              try {
+                delete ring[key];
+              } catch {}
             }
-            html,
-            body {
-                margin: 0;
-                padding: 0;
-                width: 100%;
-                height: 100%;
-                background: #111;
-                overflow: hidden;
-                font-family: sans-serif;
-            }
-            svg {
-                display: block;
-                width: 100%;
-                height: 100%;
-                cursor: crosshair;
-            }
-            .ghost {
-                fill: none;
-                stroke: rgba(255, 255, 255, 0.15);
-                stroke-width: 1.5;
-            }
-            .spinner {
-                fill: none;
-                stroke-width: 8;
-                transform-box: fill-box;
-                transform-origin: center;
-            }
-            @keyframes spin {
-                to {
-                    transform: rotate(-360deg);
+          },
+          Math.max(80, duration)
+        );
+
+        try {
+          ring[key] = tid;
+        } catch {
+          // ignore write failures in restricted environments
+        }
+      }
+
+      document.addEventListener('DOMContentLoaded', () => {
+        const svg = document.getElementById('canvas');
+        if (!svg) return;
+
+        // Initialize filter config on load
+        applyGlobalGlowConfigToFilter();
+
+        // Initialize rings for any existing spinners (e.g., if loaded with saved circles)
+        for (const c of Array.from(svg.querySelectorAll('circle.spinner'))) {
+          try {
+            createOrSyncGlow(c);
+          } catch {}
+        }
+
+        // Observe child additions so we can create glow rings for newly-created circles
+        const mo = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            if (m.type === 'childList' && m.addedNodes.length > 0) {
+              for (const n of Array.from(m.addedNodes)) {
+                if (
+                  n instanceof SVGElement &&
+                  n.classList &&
+                  n.classList.contains('spinner')
+                ) {
+                  try {
+                    createOrSyncGlow(n);
+                  } catch {}
                 }
+              }
+            } else if (
+              m.type === 'attributes' &&
+              m.target instanceof SVGElement
+            ) {
+              const el = m.target;
+              // If the spinner's stroke/color/position changes, sync the ring
+              if (
+                el.classList.contains('spinner') &&
+                (m.attributeName === 'cx' ||
+                  m.attributeName === 'cy' ||
+                  m.attributeName === 'r' ||
+                  m.attributeName === 'stroke')
+              ) {
+                try {
+                  createOrSyncGlow(el);
+                } catch {}
+              }
             }
+          }
+        });
 
-            #clearBtn {
-                position: absolute;
-                top: 20px;
-                right: 20px;
-                padding: 12px 20px;
-                font-size: 16px;
-                background: rgba(255, 255, 255, 0.1);
-                color: #fff;
-                border: 2px solid #fff;
-                border-radius: 12px;
-                cursor: pointer;
-                backdrop-filter: blur(6px);
-                transition: all 0.2s ease;
-            }
-            #clearBtn:hover {
-                background: rgba(255, 255, 255, 0.25);
-                transform: scale(1.05);
-            }
-        </style>
-    </head>
-    <body>
-        <svg id="canvas"></svg>
-        <button id="clearBtn">Clear</button>
+        mo.observe(svg, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: [
+            'cx',
+            'cy',
+            'r',
+            'stroke',
+            'data-filter-clamped',
+            'data-pan-clamped',
+            'stroke-dasharray',
+          ],
+        });
 
-        <script type="module">
-            import { init } from "./js/app.ts";
-            // Mount into the body. If you want a different container, pass a selector or element.
-            if (document.readyState === "loading") {
-                document.addEventListener("DOMContentLoaded", () =>
-                    init(document.body),
+        // Global mutation observer for attribute changes on spinner elements.
+        // When audio code toggles attributes (or scheduling code sets flags), we use this
+        // as one signal to produce a short visual flash.
+        const attrObserver = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            if (!(m.target instanceof SVGElement)) continue;
+            const el = m.target;
+            if (!el.classList || !el.classList.contains('spinner')) continue;
+
+            // Consider several attribute signals that audio code already sets (or may set).
+            // This is intentionally broad — it'll catch text attribute updates that correlate with playback.
+            if (
+              m.attributeName === 'data-filter-clamped' ||
+              m.attributeName === 'data-pan-clamped' ||
+              m.attributeName === 'stroke-dasharray'
+            ) {
+              // Quick flash with a small heuristic detail object
+              try {
+                // Use detail.duration derived from dash length heuristics where possible
+                const dash = el.getAttribute('stroke-dasharray') || '';
+                const firstNum = Number(dash.split(/\s+/)[0]) || 0;
+                flashGlowFor(el, {
+                  duration: 160,
+                  detail: {
+                    duration: Math.max(0.02, firstNum / 400),
+                    freq: 440,
+                  },
+                });
+              } catch {}
+            }
+          }
+        });
+
+        // Attach attribute observer to document-level spinner set by watching the svg subtree.
+        attrObserver.observe(svg, {
+          subtree: true,
+          attributes: true,
+          attributeFilter: [
+            'data-filter-clamped',
+            'data-pan-clamped',
+            'stroke-dasharray',
+          ],
+        });
+
+        // Support explicit programmatic triggers from audio code: dispatch CustomEvent('svg-playground:note', { detail: { circleId } })
+        document.addEventListener('svg-playground:note', (ev) => {
+          try {
+            const d = ev instanceof CustomEvent ? ev.detail : null;
+            const circleId = d && d.circleId;
+            let target = null;
+            if (circleId) {
+              target = svg.querySelector(
+                `circle[data-circle-id="${circleId}"]`
+              );
+            } else if (d && d.circle instanceof SVGElement) {
+              target = d.circle;
+            }
+            if (target instanceof SVGElement) {
+              // pass the raw detail through so flashGlowFor can compute amplitude
+              flashGlowFor(target, {
+                duration: d && d.duration ? d.duration * 1000 : 200,
+                detail: d,
+              });
+            }
+          } catch {
+            // ignore
+          }
+        });
+
+        // Also allow a generalized API: dispatch CustomEvent('svg-playground:flash', { detail: { circle: someCircle } })
+        document.addEventListener('svg-playground:flash', (ev) => {
+          try {
+            const d = ev instanceof CustomEvent ? ev.detail : null;
+            const circle = d && d.circle;
+            if (circle instanceof SVGElement) {
+              flashGlowFor(circle, {
+                duration: d && d.duration ? d.duration : 200,
+                detail: d,
+              });
+            }
+          } catch {}
+        });
+
+        // As a soft fallback: when user clicks anywhere, flash the nearest spinner if present
+        svg.addEventListener('pointerdown', (e) => {
+          try {
+            const pt = svg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
+            // find nearest spinner within a threshold
+            let nearest = null;
+            let bestD = Infinity;
+            for (const c of Array.from(
+              svg.querySelectorAll('circle.spinner')
+            )) {
+              const cx = Number(c.getAttribute('cx') || 0);
+              const cy = Number(c.getAttribute('cy') || 0);
+              const dx = cx - svgP.x;
+              const dy = cy - svgP.y;
+              const d2 = dx * dx + dy * dy;
+              if (d2 < bestD) {
+                bestD = d2;
+                nearest = c;
+              }
+            }
+            if (nearest && bestD < Math.pow(160, 2)) {
+              flashGlowFor(nearest, { duration: 220 });
+            }
+          } catch {}
+        });
+
+        // Debug panel: toggled by pressing 'D' (also used by app.ts debug view, but this panel
+        // is independent). Panel exposes glow parameters for live tuning.
+        let debugPanel = null;
+        function createDebugPanel() {
+          if (debugPanel) return;
+          debugPanel = document.createElement('div');
+          debugPanel.setAttribute('id', 'glow-debug-panel');
+          debugPanel.style.position = 'fixed';
+          debugPanel.style.right = '18px';
+          debugPanel.style.top = '72px';
+          debugPanel.style.zIndex = '10000';
+          debugPanel.style.padding = '10px';
+          debugPanel.style.background = 'rgba(16,16,16,0.86)';
+          debugPanel.style.color = '#fff';
+          debugPanel.style.border = '1px solid rgba(255,255,255,0.06)';
+          debugPanel.style.borderRadius = '8px';
+          debugPanel.style.fontFamily = 'sans-serif';
+          debugPanel.style.fontSize = '12px';
+          debugPanel.style.width = '260px';
+          debugPanel.style.boxShadow = '0 4px 18px rgba(0,0,0,0.6)';
+          debugPanel.innerHTML = `
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                  <strong>Glow Debug</strong>
+                  <button id="glow-debug-close" style="background:transparent;border:0;color:#fff;cursor:pointer">✕</button>
+                </div>
+                <label>Blur: <span id="g-blur-val">${__GLOW_CONFIG.blur}</span></label>
+                <input id="g-blur" type="range" min="0" max="20" step="1" value="${__GLOW_CONFIG.blur}" style="width:100%"/>
+                <label>Opacity ×: <span id="g-op-val">${__GLOW_CONFIG.opacityMultiplier.toFixed(2)}</span></label>
+                <input id="g-op" type="range" min="0" max="3" step="0.01" value="${__GLOW_CONFIG.opacityMultiplier}" style="width:100%"/>
+                <label>Scale ×: <span id="g-scale-val">${__GLOW_CONFIG.scaleMultiplier.toFixed(2)}</span></label>
+                <input id="g-scale" type="range" min="0.25" max="3" step="0.01" value="${__GLOW_CONFIG.scaleMultiplier}" style="width:100%"/>
+                <label>Pulse:</label>
+                <select id="g-pulse" style="width:100%;margin-bottom:6px">
+                  <option value="on" ${__GLOW_CONFIG.pulseEnabled ? 'selected' : ''}>On</option>
+                  <option value="off" ${!__GLOW_CONFIG.pulseEnabled ? 'selected' : ''}>Off</option>
+                </select>
+                <label>Pulse duration (ms): <span id="g-pulse-val">${__GLOW_CONFIG.pulseDuration}</span></label>
+                <input id="g-pulse-dur" type="range" min="60" max="1000" step="10" value="${__GLOW_CONFIG.pulseDuration}" style="width:100%"/>
+                <div style="margin-top:8px;display:flex;gap:8px">
+                  <button id="g-apply" style="flex:1;padding:6px;border-radius:6px;border:0;background:#2e7d32;color:#fff;cursor:pointer">Apply</button>
+                  <button id="g-reset" style="flex:1;padding:6px;border-radius:6px;border:0;background:#666;color:#fff;cursor:pointer">Reset</button>
+                </div>
+              `;
+          document.body.appendChild(debugPanel);
+
+          const el = debugPanel;
+          function wire() {
+            const blurIn = el.querySelector('#g-blur');
+            const blurVal = el.querySelector('#g-blur-val');
+            const opIn = el.querySelector('#g-op');
+            const opVal = el.querySelector('#g-op-val');
+            const scaleIn = el.querySelector('#g-scale');
+            const scaleVal = el.querySelector('#g-scale-val');
+            const pulseIn = el.querySelector('#g-pulse');
+            const pulseDurIn = el.querySelector('#g-pulse-dur');
+            const pulseDurVal = el.querySelector('#g-pulse-val');
+            const applyBtn = el.querySelector('#g-apply');
+            const resetBtn = el.querySelector('#g-reset');
+            const closeBtn = el.querySelector('#glow-debug-close');
+
+            if (blurIn && blurVal) {
+              blurIn.addEventListener('input', (ev) => {
+                blurVal.textContent = blurIn.value;
+              });
+            }
+            if (opIn && opVal) {
+              opIn.addEventListener('input', (ev) => {
+                opVal.textContent = Number(opIn.value).toFixed(2);
+              });
+            }
+            if (scaleIn && scaleVal) {
+              scaleIn.addEventListener('input', (ev) => {
+                scaleVal.textContent = Number(scaleIn.value).toFixed(2);
+              });
+            }
+            if (pulseDurIn && pulseDurVal) {
+              pulseDurIn.addEventListener('input', (ev) => {
+                pulseDurVal.textContent = pulseDurIn.value;
+              });
+            }
+            if (applyBtn) {
+              applyBtn.addEventListener('click', () => {
+                __GLOW_CONFIG.blur = Number(blurIn.value);
+                __GLOW_CONFIG.opacityMultiplier = Number(opIn.value);
+                __GLOW_CONFIG.scaleMultiplier = Number(scaleIn.value);
+                __GLOW_CONFIG.pulseEnabled = pulseIn.value === 'on';
+                __GLOW_CONFIG.pulseDuration = Number(pulseDurIn.value);
+                applyGlobalGlowConfigToFilter();
+              });
+            }
+            if (resetBtn) {
+              resetBtn.addEventListener('click', () => {
+                __GLOW_CONFIG.blur = 6;
+                __GLOW_CONFIG.opacityMultiplier = 1.0;
+                __GLOW_CONFIG.scaleMultiplier = 1.0;
+                __GLOW_CONFIG.pulseEnabled = true;
+                __GLOW_CONFIG.pulseDuration = 360;
+                // update inputs
+                el.querySelector('#g-blur').value = String(__GLOW_CONFIG.blur);
+                el.querySelector('#g-op').value = String(
+                  __GLOW_CONFIG.opacityMultiplier
                 );
-            } else {
-                init(document.body);
+                el.querySelector('#g-scale').value = String(
+                  __GLOW_CONFIG.scaleMultiplier
+                );
+                el.querySelector('#g-pulse').value = __GLOW_CONFIG.pulseEnabled
+                  ? 'on'
+                  : 'off';
+                el.querySelector('#g-pulse-dur').value = String(
+                  __GLOW_CONFIG.pulseDuration
+                );
+                applyGlobalGlowConfigToFilter();
+              });
             }
-        </script>
-    </body>
+            if (closeBtn) {
+              closeBtn.addEventListener('click', () => {
+                try {
+                  document.body.removeChild(debugPanel);
+                  debugPanel = null;
+                } catch {}
+              });
+            }
+          }
+          wire();
+        }
+
+        // Toggle debug panel when D is pressed (mirrors the overlay key in app.ts)
+        document.addEventListener('keydown', (ev) => {
+          if (ev.code === 'KeyD') {
+            if (!debugPanel) createDebugPanel();
+            else {
+              try {
+                document.body.removeChild(debugPanel);
+                debugPanel = null;
+              } catch {}
+            }
+          }
+        });
+      });
+    </script>
+  </body>
 </html>

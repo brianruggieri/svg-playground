@@ -20,6 +20,12 @@ import type { SegmentInput } from './utils';
 
 export type CirclePos = { x: number; y: number };
 
+export type ActiveOscillatorRecord = {
+  osc: OscillatorNode;
+  gain?: GainNode | null; // per-oscillator gain node (if present)
+  baseGain?: number; // computed base gain used for this voice (for recalculation)
+};
+
 export type CircleState = {
   // Core, present fields
   pos: CirclePos;
@@ -28,7 +34,8 @@ export type CircleState = {
   // Optional runtime handles
   liveAudioNodes?: LiveAudioNodes | null;
   loopTimeout?: number | null;
-  activeOscillators?: OscillatorNode[]; // oscillators created for scheduled notes
+  // Store richer records for active oscillators so we can update per-voice gain in-flight.
+  activeOscillators?: ActiveOscillatorRecord[]; // oscillators + optional gain nodes created for scheduled notes
   segments?: SegmentInput[]; // recorded segments during hold
   holdDuration?: number; // milliseconds
   scheduledUntil?: number | null; // audioContext.currentTime up to which we've scheduled
@@ -57,6 +64,7 @@ export function ensureCircleState(
     rng: init?.rng ?? defaultRng,
     liveAudioNodes: init?.liveAudioNodes ?? null,
     loopTimeout: init?.loopTimeout ?? null,
+    // accept provided activeOscillators if present (compatible shape) or default to empty array
     activeOscillators: init?.activeOscillators ?? [],
     segments: init?.segments ?? [],
     holdDuration: init?.holdDuration,
@@ -193,16 +201,18 @@ export function stopAndClearLiveAudioNodes(circle: SVGCircleElement): void {
 
 export function addActiveOscillator(
   circle: SVGCircleElement,
-  osc: OscillatorNode
+  osc: OscillatorNode,
+  gainNode?: GainNode | null,
+  baseGain?: number
 ): void {
   const st = ensureCircleState(circle);
   st.activeOscillators = st.activeOscillators ?? [];
-  st.activeOscillators.push(osc);
+  st.activeOscillators.push({ osc, gain: gainNode ?? null, baseGain });
 }
 
 export function getActiveOscillators(
   circle: SVGCircleElement
-): OscillatorNode[] {
+): ActiveOscillatorRecord[] {
   return stateMap.get(circle)?.activeOscillators ?? [];
 }
 
@@ -212,14 +222,27 @@ export function stopAndClearActiveOscillators(circle: SVGCircleElement): void {
   const arr = st?.activeOscillators;
   if (!arr || arr.length === 0) return;
 
-  for (const o of arr) {
+  for (const rec of arr) {
     try {
-      o.stop();
+      // stop oscillator (best-effort)
+      rec.osc.stop();
     } catch {
       // ignore
     }
     try {
-      o.disconnect();
+      // disconnect oscillator -> gain (if present) and gain -> rest
+      if (rec.gain) {
+        try {
+          rec.gain.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      rec.osc.disconnect();
     } catch {
       // ignore
     }
