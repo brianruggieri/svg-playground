@@ -1,6 +1,7 @@
 import { CIRCLE_RADIUS, CIRCLE_CIRCUMFERENCE } from './constants';
 import { mulberry32, randomColor } from './utils';
-import type { CircleWithState } from './audio';
+
+import { ensureCircleState } from './state';
 
 /**
  * Create a ghost outline and an active circle at the given SVG location.
@@ -12,7 +13,7 @@ import type { CircleWithState } from './audio';
 export function createCircleAt(
   svg: SVGSVGElement,
   loc: { x: number; y: number }
-): CircleWithState {
+): SVGCircleElement {
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   // Ghost outline (subtle visual indicator while recording)
@@ -27,7 +28,7 @@ export function createCircleAt(
   const circle = document.createElementNS(
     SVG_NS,
     'circle'
-  ) as unknown as CircleWithState;
+  ) as unknown as SVGCircleElement;
   circle.setAttribute('cx', String(loc.x));
   circle.setAttribute('cy', String(loc.y));
   circle.setAttribute('r', String(CIRCLE_RADIUS));
@@ -46,12 +47,12 @@ export function createCircleAt(
   circle.setAttribute('stroke-dasharray', `0 ${CIRCLE_CIRCUMFERENCE}`);
   circle.setAttribute('stroke-dashoffset', '0.5');
 
-  // Attach minimal runtime state used elsewhere (audio scheduling, cleanup)
-  circle._pos = { x: loc.x, y: loc.y };
-
-  // Seeded RNG for deterministic timbral variation per circle
+  // Seed state for this circle (position + seeded RNG) using the WeakMap-backed state manager
   const seed = Math.floor(loc.x * 1000 + loc.y * 1000 + performance.now());
-  circle._rng = mulberry32(seed);
+  ensureCircleState(circle as unknown as SVGCircleElement, {
+    pos: { x: loc.x, y: loc.y },
+    rng: mulberry32(seed),
+  });
 
   // Append to DOM and return the typed circle
   svg.appendChild(circle as unknown as SVGCircleElement);

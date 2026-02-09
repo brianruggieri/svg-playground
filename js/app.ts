@@ -27,9 +27,17 @@ import {
   createLiveAudio,
   fadeAndCleanupLiveAudio,
   loopCircleAudio,
-  CircleWithState,
 } from './audio';
 import { createCircleAt } from './circles';
+import {
+  setSegments,
+  setHoldDuration,
+  setLiveAudioNodes,
+  getLiveAudioNodes,
+  getLoopTimeout,
+  clearLoopTimeout,
+  stopAndClearActiveOscillators,
+} from './state';
 
 export type InitOptions = {
   audioCtx?: AudioContext;
@@ -81,7 +89,7 @@ export function init(
   const audioCtx = options.audioCtx ?? createAudioContext();
 
   // Instance local state
-  let currentCircle: (CircleWithState & SVGCircleElement) | null = null;
+  let currentCircle: SVGCircleElement | null = null;
   let holdStart: number | null = null;
   let lastSegmentStart: number | null = null;
   let isSpaceDown = false;
@@ -145,9 +153,24 @@ export function init(
     currentCircle.setAttribute('stroke-dashoffset', '0.5');
     currentCircle.style.animation = `spin ${total / 1000}s linear infinite`;
 
-    // store metadata for the loop scheduler
-    (currentCircle as any)._segments = segments.slice();
-    (currentCircle as any)._holdDuration = total;
+    // store metadata for the loop scheduler (WeakMap-backed state)
+    setSegments(currentCircle as SVGCircleElement, segments.slice());
+    setHoldDuration(currentCircle as SVGCircleElement, total);
+
+    // Debug: log scheduling details to help diagnose looping issues
+    try {
+      const cx = currentCircle.getAttribute('cx');
+      const cy = currentCircle.getAttribute('cy');
+      console.debug('[finalizeCurrentCircle] scheduling loop', {
+        cx,
+        cy,
+        total,
+        segments: segments.slice(),
+        dashArray,
+      });
+    } catch {
+      // ignore debug failures in environments without console
+    }
 
     // schedule looped audio for this circle
     loopCircleAudio(audioCtx, currentCircle);
@@ -197,8 +220,8 @@ export function init(
 
     const loc = toSvgPoint(svgEl, e);
     const created = createCircleAt(svgEl, loc);
-    // Type assert into expected CircleWithState
-    currentCircle = created as CircleWithState & SVGCircleElement;
+    // Type assert into SVGCircleElement
+    currentCircle = created as SVGCircleElement;
 
     holdStart = performance.now();
     lastSegmentStart = holdStart;
@@ -208,13 +231,13 @@ export function init(
     startLivePreview();
   }
 
-  function onPointerUp(_: PointerEvent) {
+  function onPointerUp() {
     // If no active recording, nothing to do
     if (!currentCircle) return;
     finalizeCurrentCircle();
   }
 
-  function onPointerCancel(_: PointerEvent) {
+  function onPointerCancel() {
     abortCurrentRecording();
   }
 
@@ -244,13 +267,14 @@ export function init(
     );
     const noteScale = chooseScale(analysis);
 
-    // create live audio nodes and attach to circle
-    (currentCircle as any)._liveAudioNodes = createLiveAudio(
+    // create live audio nodes and attach to circle state
+    const liveNodes = createLiveAudio(
       audioCtx,
       currentCircle,
       analysis,
       noteScale
     );
+    setLiveAudioNodes(currentCircle as SVGCircleElement, liveNodes);
 
     e.preventDefault();
   }
@@ -277,43 +301,28 @@ export function init(
     for (const c of circles) {
       // cancel loop timeout
       try {
-        const maybeTimeout = (c as any)._loopTimeout;
+        const maybeTimeout = getLoopTimeout(c);
         if (typeof maybeTimeout === 'number') {
-          clearTimeout(maybeTimeout);
-          (c as any)._loopTimeout = null;
+          // clearLoopTimeout will clear the timeout and null the entry in state
+          clearLoopTimeout(c);
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // ignore
       }
       // fade live audio
       try {
-        if ((c as any)._liveAudioNodes)
-          fadeAndCleanupLiveAudio(audioCtx, c as any);
-      } catch {
-        /* ignore */
-      }
-      // stop active oscillators
-      try {
-        const arr = (c as any)._activeOscillators as
-          | (OscillatorNode | undefined)[]
-          | undefined;
-        if (Array.isArray(arr)) {
-          for (const o of arr) {
-            try {
-              o?.stop();
-            } catch {
-              /* ignore */
-            }
-            try {
-              o?.disconnect();
-            } catch {
-              /* ignore */
-            }
-          }
-          (c as any)._activeOscillators = [];
+        const nodes = getLiveAudioNodes(c);
+        if (nodes) {
+          fadeAndCleanupLiveAudio(audioCtx, c);
         }
       } catch {
-        /* ignore */
+        // ignore
+      }
+      try {
+        // stop and clear active oscillators tracked in state
+        stopAndClearActiveOscillators(c);
+      } catch {
+        // ignore
       }
       try {
         c.remove();
@@ -357,46 +366,32 @@ export function init(
     const circles = Array.from(svgEl.querySelectorAll('circle'));
     for (const c of circles) {
       try {
-        const maybeTimeout = (c as any)._loopTimeout;
+        const maybeTimeout = getLoopTimeout(c);
         if (typeof maybeTimeout === 'number') {
-          clearTimeout(maybeTimeout);
-          (c as any)._loopTimeout = null;
+          clearLoopTimeout(c);
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // ignore
       }
       try {
-        if ((c as any)._liveAudioNodes)
-          fadeAndCleanupLiveAudio(audioCtx, c as any);
+        const nodes = getLiveAudioNodes(c);
+        if (nodes) fadeAndCleanupLiveAudio(audioCtx, c);
       } catch {
-        /* ignore */
+        // ignore
       }
       try {
-        const arr = (c as any)._activeOscillators as
-          | (OscillatorNode | undefined)[]
-          | undefined;
-        if (Array.isArray(arr)) {
-          for (const o of arr) {
-            try {
-              o?.stop();
-            } catch {
-              /* ignore */
-            }
-            try {
-              o?.disconnect();
-            } catch {
-              /* ignore */
-            }
-          }
-          (c as any)._activeOscillators = [];
+        // Stop and clear active oscillators via the state manager
+        stopAndClearActiveOscillators(c);
+      } catch (err) {
+        // ignore
+      }
+      try {
+        const nodes = getLiveAudioNodes(c);
+        if (nodes) {
+          fadeAndCleanupLiveAudio(audioCtx, c);
         }
-      } catch {
-        /* ignore */
-      }
-      try {
-        c.remove();
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // ignore
       }
     }
     trackedCircles.clear();

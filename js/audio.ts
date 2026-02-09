@@ -3,72 +3,66 @@
  *
  * Audio engine for Dash‑Synced Generative Audio Circles
  *
- * Exports:
- * - createAudioContext(): AudioContext
- * - playRichTone(...)
- * - createLiveAudio(...)
- * - fadeAndCleanupLiveAudio(...)
- * - loopCircleAudio(...)
- *
- * This file is written in TypeScript and depends on `./constants` and `./utils`.
+ * This refactor uses the WeakMap-backed `state` module for per-circle runtime
+ * handles instead of attaching ad-hoc properties to DOM elements. That keeps
+ * TypeScript types precise and avoids `any` casts elsewhere.
  */
 
+import { LIVE_AUDIO_FADE_SEC } from './constants';
+import { analyzeSegments, chooseScale, SegmentLength } from './utils';
 import {
-  LIVE_AUDIO_FADE_SEC,
-  LOOP_SCHEDULE_AHEAD_SEC,
-} from "./constants";
-import {
-  analyzeSegments,
-  chooseScale,
-  SegmentLength,
-} from "./utils";
+  ensureCircleState,
+  getPos,
+  getRng,
+  addActiveOscillator,
+  setLiveAudioNodes,
+  getLiveAudioNodes,
+  setLoopTimeout,
+  setScheduledUntil,
+  clearLoopTimeout,
+  stopAndClearLiveAudioNodes,
+  getHoldDuration,
+} from './state';
 
 /* -------------------------------------------------------------------------- */
-/* Types and small helpers                                                     */
+/* Types                                                                      */
 /* -------------------------------------------------------------------------- */
 
 export type LiveAudioNodes = {
   gain: GainNode;
   filter: BiquadFilterNode;
   panner: StereoPannerNode;
-  oscillators: (OscillatorNode | AudioBufferSourceNode)[];
+  oscillators: OscillatorNode[];
 };
 
-export interface CircleWithState extends SVGCircleElement {
-  // Required runtime fields used by the app
-  _pos: { x: number; y: number };
-  _rng: () => number;
-
-  // Optional audio/state handles
-  _activeOscillators?: OscillatorNode[];
-  _liveAudioNodes?: LiveAudioNodes | null;
-  _loopTimeout?: number | null;
-  _holdDuration?: number; // milliseconds
-  _segments?: Array<{ type: string; duration: number }>;
-}
-
 /* -------------------------------------------------------------------------- */
-/* Audio helpers                                                              */
+/* Utilities                                                                  */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Create (or return) an AudioContext. Caller can also supply one.
+ * Create an AudioContext. Throws if Web Audio API isn't present.
  */
 export function createAudioContext(): AudioContext {
-  return new (window.AudioContext || (window as any).webkitAudioContext)();
+  const win = window as unknown as {
+    AudioContext?: typeof AudioContext;
+    webkitAudioContext?: typeof AudioContext;
+  };
+  const Ctor = win.AudioContext ?? win.webkitAudioContext;
+  if (!Ctor) {
+    throw new Error('Web Audio API is not available in this environment');
+  }
+  return new Ctor();
 }
+
+/* -------------------------------------------------------------------------- */
+/* Synthesis                                                                  */
+/* -------------------------------------------------------------------------- */
 
 /**
  * Play a short rich tone scheduled at `startTime` for `duration`.
  *
- * - freq: base frequency (Hz)
- * - pan: stereo pan (-1..1)
- * - duration: seconds
- * - yFactor: normalized vertical position (0..1) used to scale gain/filter
- * - startTime: audioCtx.currentTime + offset (seconds)
- * - rng: seeded RNG function (returns 0..1)
- * - circle: the SVG circle instance (used to track active oscillators)
- * - analysis: result from analyzeSegments(...) to influence timbre
+ * Note: `circle` is a plain `SVGCircleElement`. Per-circle runtime data
+ * (position, rng, etc.) is read from the `state` module (WeakMap).
  */
 export function playRichTone(
   audioCtx: AudioContext,
@@ -78,21 +72,19 @@ export function playRichTone(
   yFactor: number,
   startTime: number,
   rng: () => number,
-  circle: CircleWithState,
-  analysis: ReturnType<typeof analyzeSegments>,
+  circle: SVGCircleElement,
+  analysis: ReturnType<typeof analyzeSegments>
 ): void {
-  // Gain envelope (volume)
   const gain = audioCtx.createGain();
   const baseGain = 0.1 + yFactor * 0.3;
   gain.gain.value = baseGain;
 
-  // Determine harmonic count from complexity
   const harmonics = 1 + Math.floor(analysis.complexity / 3);
-  const detunes = Array.from({ length: harmonics }, (_, i) =>
-    i * 5 * (rng() > 0.5 ? 1 : -1),
+  const detunes = Array.from(
+    { length: harmonics },
+    (_, i) => i * 5 * (rng() > 0.5 ? 1 : -1)
   );
 
-  // Short segments -> sharper attack, long segments -> smoother
   const attackTime = Math.max(0.001, (analysis.avgDashLength || 0) * 0.1);
 
   gain.gain.setValueAtTime(0, startTime);
@@ -100,57 +92,62 @@ export function playRichTone(
   gain.gain.linearRampToValueAtTime(0, startTime + duration);
 
   const filter = audioCtx.createBiquadFilter();
-  filter.type = "lowpass";
-  // base cutoff influenced by pan (horizontal) and yFactor (vertical)
+  filter.type = 'lowpass';
   filter.frequency.value = 500 + pan * 2000 + yFactor * 3000;
   filter.Q.value = 1 + (analysis.dashGapRatio || 0) * 5;
 
   const panner = new StereoPannerNode(audioCtx, { pan });
 
-  // Connect filter -> gain -> panner -> destination
   filter.connect(gain);
   gain.connect(panner);
   panner.connect(audioCtx.destination);
 
-  // Create harmonic oscillators and schedule them
+  // Create and schedule oscillators. Track them in the state map via helper.
   detunes.forEach((detune) => {
     const osc = audioCtx.createOscillator();
-    // Choose waveform based on average dash length
-    osc.type = analysis.avgDashLength > 0.2 ? "sine" : "triangle";
+    osc.type = analysis.avgDashLength > 0.2 ? 'sine' : 'triangle';
     osc.frequency.value = freq * (1 + detune / 1200);
     osc.connect(filter);
     osc.start(startTime);
     osc.stop(startTime + duration);
 
-    // Track active oscillators on the circle for cleanup
-    circle._activeOscillators = circle._activeOscillators || [];
-    circle._activeOscillators.push(osc);
+    // Track on the circle state for later cleanup
+    addActiveOscillator(circle, osc);
   });
 }
 
+/* -------------------------------------------------------------------------- */
+/* Live preview                                                               */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Create live audio nodes that play while the user holds Space.
- * Returns a LiveAudioNodes object that the caller should store on the circle.
+ * Create live audio nodes used during recording preview.
+ * Returns a LiveAudioNodes object and stores it in the state map.
  */
 export function createLiveAudio(
   audioCtx: AudioContext,
-  circle: CircleWithState,
+  circle: SVGCircleElement,
   analysis: ReturnType<typeof analyzeSegments>,
-  noteScale: number[],
+  noteScale: number[]
 ): LiveAudioNodes {
-  const x = circle._pos.x;
-  const y = circle._pos.y;
-  const pan = (x / window.innerWidth) * 2 - 1;
-  const yFactor = y / window.innerHeight;
+  // Ensure the circle has state and read pos/rng
+  ensureCircleState(circle);
+  const pos = getPos(circle) ?? { x: 0, y: 0 };
+  const rng = getRng(circle) ?? (() => Math.random());
 
-  const noteIndex = Math.floor(circle._rng() * noteScale.length);
+  const x = pos.x;
+  const y = pos.y;
+  const pan = (x / window.innerWidth) * 2 - 1;
+  const yFactor = 1 - y / window.innerHeight;
+
+  const noteIndex = Math.floor(rng() * noteScale.length);
   const baseFreq = noteScale[noteIndex];
 
   const mainGain = audioCtx.createGain();
   mainGain.gain.value = 0.1 + yFactor * 0.3;
 
   const filter = audioCtx.createBiquadFilter();
-  filter.type = "lowpass";
+  filter.type = 'lowpass';
   filter.frequency.value = 500 + pan * 2000 + yFactor * 3000;
   filter.Q.value = 1 + (analysis.dashGapRatio || 0) * 5;
 
@@ -160,13 +157,14 @@ export function createLiveAudio(
   panner.connect(audioCtx.destination);
 
   const harmonics = 1 + Math.floor(analysis.complexity / 3);
-  const detunes = Array.from({ length: harmonics }, (_, i) =>
-    i * 5 * (circle._rng() > 0.5 ? 1 : -1),
+  const detunes = Array.from(
+    { length: harmonics },
+    (_, i) => i * 5 * (rng() > 0.5 ? 1 : -1)
   );
 
   const oscillators: OscillatorNode[] = detunes.map((detune) => {
     const osc = audioCtx.createOscillator();
-    osc.type = analysis.avgDashLength > 0.2 ? "sine" : "triangle";
+    osc.type = analysis.avgDashLength > 0.2 ? 'sine' : 'triangle';
     osc.frequency.value = baseFreq * (1 + detune / 1200);
     osc.connect(filter);
     osc.start();
@@ -180,71 +178,96 @@ export function createLiveAudio(
     oscillators,
   };
 
+  // Persist nodes in the state for later fade/cleanup
+  setLiveAudioNodes(circle, nodes);
   return nodes;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Fade / cleanup helpers                                                     */
+/* -------------------------------------------------------------------------- */
+
 /**
  * Fade out and cleanup live audio nodes attached to a circle.
- * This function will schedule a small fade and then stop/disconnect nodes.
+ * Uses state helpers instead of element-attached properties.
  */
 export function fadeAndCleanupLiveAudio(
   audioCtx: AudioContext,
-  circle: CircleWithState,
+  circle: SVGCircleElement
 ): void {
-  const nodes = circle._liveAudioNodes;
+  const nodes = getLiveAudioNodes(circle);
   if (!nodes) return;
 
   const now = audioCtx.currentTime;
   try {
     nodes.gain.gain.linearRampToValueAtTime(0, now + LIVE_AUDIO_FADE_SEC);
   } catch {
-    // ignore if scheduling fails
+    // ignore scheduling failures
   }
 
-  // Delay slightly more than the fade duration to ensure ramp completes
-  window.setTimeout(() => {
-    const n = circle._liveAudioNodes;
-    if (!n) return;
-    try {
-      n.oscillators.forEach((osc) => {
-        try {
-          osc.stop();
-        } catch {
-          // ignore
+  // Delay a bit longer than the fade to ensure the ramp completed
+  window.setTimeout(
+    () => {
+      const n = getLiveAudioNodes(circle);
+      if (!n) return;
+
+      try {
+        for (const osc of n.oscillators) {
+          try {
+            osc.stop();
+          } catch {
+            // ignore
+          }
+          try {
+            osc.disconnect();
+          } catch {
+            // ignore
+          }
         }
-        try {
-          osc.disconnect();
-        } catch {
-          // ignore
-        }
-      });
-    } catch {
-      // ignore
-    }
-    try {
-      n.filter.disconnect();
-    } catch {}
-    try {
-      n.gain.disconnect();
-    } catch {}
-    try {
-      n.panner.disconnect();
-    } catch {}
-    circle._liveAudioNodes = null;
-  }, Math.round(LIVE_AUDIO_FADE_SEC * 1000) + 20);
+      } catch {
+        // ignore
+      }
+
+      try {
+        n.filter.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        n.gain.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        n.panner.disconnect();
+      } catch {
+        // ignore
+      }
+
+      // clear stored live nodes in state
+      stopAndClearLiveAudioNodes(circle);
+    },
+    Math.round(LIVE_AUDIO_FADE_SEC * 1000) + 20
+  );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Loop scheduling                                                            */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Convert a circle's stroke-dasharray into a sequence of segments (lengths),
- * analyze them and schedule looping playback. The function stores a timeout
- * identifier on `circle._loopTimeout` so it can be cancelled later.
+ * Convert a circle's stroke-dasharray into a sequence of segments and schedule looping playback.
+ * Scheduling info (scheduledUntil / loopTimeout) is stored in the state map.
  */
 export function loopCircleAudio(
   audioCtx: AudioContext,
-  circle: CircleWithState,
+  circle: SVGCircleElement
 ): void {
-  const rotationPeriod = (circle._holdDuration || 1000) / 1000; // seconds
-  const dashAttr = circle.getAttribute("stroke-dasharray") || "";
+  // Read hold duration from state if present; fallback to 1000ms
+  const holdMs = getHoldDuration(circle) ?? 1000;
+  const rotationPeriod = holdMs / 1000; // seconds
+
+  const dashAttr = circle.getAttribute('stroke-dasharray') || '';
   const dashArray = dashAttr
     .split(/\s+/)
     .map((s) => Number(s))
@@ -254,27 +277,58 @@ export function loopCircleAudio(
 
   const totalLength = dashArray.reduce((a, b) => a + b, 0) || 1;
   const segmentsLoop: SegmentLength[] = dashArray.map((len, i) => ({
-    type: i % 2 === 0 ? "dash" : "gap",
+    type: i % 2 === 0 ? 'dash' : 'gap',
     length: len,
   }));
 
   const analysis = analyzeSegments(segmentsLoop, totalLength);
   const scale = chooseScale(analysis);
 
-  const x = circle._pos.x;
-  const y = circle._pos.y;
+  const pos = getPos(circle) ?? { x: 0, y: 0 };
+  const x = pos.x;
+  const y = pos.y;
   const pan = (x / window.innerWidth) * 2 - 1;
-  const yFactor = y / window.innerHeight;
+  const yFactor = 1 - y / window.innerHeight;
 
-  function scheduleLoopAhead(): void {
-    let t = audioCtx.currentTime + LOOP_SCHEDULE_AHEAD_SEC;
+  // Clear any previous scheduled loop to avoid duplicates
+  clearLoopTimeout(circle);
 
-    segmentsLoop.forEach((seg) => {
+  // Helper that schedules all dash segments for one rotation starting at startTime.
+  const scheduleOneRotation = (startTime: number) => {
+    // Debug: report when we start scheduling a rotation
+    try {
+      console.debug('[loopCircleAudio] scheduleOneRotation start', {
+        circle,
+        startTime,
+        rotationPeriod,
+        segments: segmentsLoop.length,
+        totalLength,
+      });
+    } catch {
+      /* ignore debug failures */
+    }
+
+    let t = startTime;
+    for (const seg of segmentsLoop) {
       const dur = (seg.length / totalLength) * rotationPeriod;
-      if (seg.type === "dash" && dur > 0) {
-        const noteIndex = Math.floor(circle._rng() * scale.length);
-        const freq = scale[noteIndex] * (0.995 + circle._rng() * 0.01);
+      if (seg.type === 'dash' && dur > 0) {
+        const rng = getRng(circle) ?? Math.random;
+        const noteIndex = Math.floor(rng() * scale.length);
+        const freq = scale[noteIndex] * (0.995 + rng() * 0.01);
         try {
+          // Debug: log each scheduled note
+          try {
+            console.debug('[loopCircleAudio] scheduling note', {
+              freq: Number(freq.toFixed(2)),
+              start: Number(t.toFixed(3)),
+              dur: Number(dur.toFixed(3)),
+              pan: Number(pan.toFixed(3)),
+              circle,
+            });
+          } catch {
+            /* ignore debug failures */
+          }
+
           playRichTone(
             audioCtx,
             freq,
@@ -282,23 +336,59 @@ export function loopCircleAudio(
             dur,
             yFactor,
             t,
-            circle._rng,
+            rng,
             circle,
-            analysis,
+            analysis
           );
-        } catch {
-          // Ignore playback scheduling errors for robustness
+        } catch (err) {
+          // ignore scheduling errors but surface a debug message
+          try {
+            console.warn('[loopCircleAudio] scheduling error', {
+              err,
+              circle,
+              freq,
+              t,
+              dur,
+            });
+          } catch {
+            /* ignore debug failures */
+          }
         }
       }
       t += dur;
-    });
+    }
+    // Persist scheduled horizon (one rotation from startTime)
+    setScheduledUntil(circle, t);
 
-    // schedule next loop (subtract schedule-ahead so loops chain cleanly)
-    const delayMs = Math.max(50, Math.round((rotationPeriod - LOOP_SCHEDULE_AHEAD_SEC) * 1000));
-    // store timeout id so it can be cleared by callers
-    circle._loopTimeout = window.setTimeout(scheduleLoopAhead, delayMs);
+    // Debug: report completed scheduling horizon
+    try {
+      console.debug('[loopCircleAudio] scheduled rotation horizon', {
+        circle,
+        horizon: t,
+      });
+    } catch {
+      /* ignore debug failures */
+    }
+  };
+
+  // Schedule immediately for the upcoming rotation, then use setInterval to repeat.
+  const now = audioCtx.currentTime;
+  const startTime = now + 0.02; // slight offset to allow audio graph to settle
+  scheduleOneRotation(startTime);
+
+  // Repeat every rotation period (ms). Use setInterval for steady repetition.
+  const intervalMs = Math.max(20, Math.round(rotationPeriod * 1000));
+  const id = window.setInterval(() => {
+    const s = audioCtx.currentTime + 0.02;
+    scheduleOneRotation(s);
+  }, intervalMs);
+
+  // Debug: report interval creation
+  try {
+    console.debug('[loopCircleAudio] setInterval', { circle, intervalMs, id });
+  } catch {
+    /* ignore debug failures */
   }
 
-  // Start scheduling
-  scheduleLoopAhead();
+  setLoopTimeout(circle, id as unknown as number);
 }
