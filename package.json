@@ -6,6 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint \"js/**/*.{ts,js}\"",
     "lint:fix": "eslint \"js/**/*.{ts,js}\" --fix",
     "format": "prettier --write \"**/*.{ts,js,json,md,css,html}\""
@@ -19,13 +20,14 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "vite": "^5.4.21",
-    "eslint": "^8.50.0",
-    "prettier": "^3.0.0",
-    "eslint-config-prettier": "^8.8.0",
-    "eslint-plugin-prettier": "^5.0.0",
-    "@typescript-eslint/eslint-plugin": "^6.0.0",
-    "@typescript-eslint/parser": "^6.0.0"
+    "vite": "^7.3.1",
+    "eslint": "^8.57.1",
+    "prettier": "^3.8.1",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.5",
+    "@typescript-eslint/eslint-plugin": "^8.55.0",
+    "@typescript-eslint/parser": "^8.55.0",
+    "typescript": "5.4.5"
   },
   "engines": {
     "node": ">=20.17.0"

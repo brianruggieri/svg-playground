@@ -32,6 +32,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run TypeScript typecheck
+        run: npx tsc --noEmit
+
       - name: Run ESLint
         # Fail the job on any warnings as well (--max-warnings=0)
         run: npx eslint "js/**/*.{ts,js}" --max-warnings=0

@@ -3,6 +3,12 @@ import { mulberry32, randomColor } from './utils';
 
 import { ensureCircleState, deleteState } from './state';
 
+type SVGStyle = CSSStyleDeclaration & {
+  // non-standard but widely supported on SVG elements in modern browsers
+  transformBox?: string;
+  transformOrigin?: string;
+};
+
 /**
  * Create a ghost outline and an active circle at the given SVG location.
  * Returns the created circle element augmented with runtime state.
@@ -104,18 +110,18 @@ export function emotionalExit(
       try {
         // Make sure element participates visually in the transition
         // Use inline styles to avoid requiring external CSS changes.
-        (el.style as any).transition =
+        (el.style as SVGStyle).transition =
           `transform ${durationMs}ms cubic-bezier(.22,.9,.35,1), opacity ${durationMs}ms ease-out`;
         // SVG transform origin via CSS; fallback to setting transformBox/Origin
         try {
-          (el.style as any).transformBox = 'fill-box';
-          (el.style as any).transformOrigin = '50% 50%';
+          (el.style as SVGStyle).transformBox = 'fill-box';
+          (el.style as SVGStyle).transformOrigin = '50% 50%';
         } catch {
           /* ignore transform origin failures */
         }
         // Trigger the exit: shrink & fade
-        (el.style as any).opacity = '0';
-        (el.style as any).transform = 'scale(0.18)';
+        (el.style as SVGStyle).opacity = '0';
+        (el.style as SVGStyle).transform = 'scale(0.18)';
         // Optionally reduce stroke-width for a more delicate fade (non-critical)
         try {
           const sw = el.getAttribute('stroke-width');

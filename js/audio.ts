@@ -252,27 +252,27 @@ export function playClickTone(
       window.setTimeout(() => {
         try {
           oscA.disconnect();
-        } catch (err) {
+        } catch {
           /* ignore */
         }
         try {
           oscB.disconnect();
-        } catch (err) {
+        } catch {
           /* ignore */
         }
         try {
           filt.disconnect();
-        } catch (err) {
+        } catch {
           /* ignore */
         }
         try {
           g.disconnect();
-        } catch (err) {
+        } catch {
           /* ignore */
         }
         try {
           p.disconnect();
-        } catch (err) {
+        } catch {
           /* ignore */
         }
       }, cleanupMs);
@@ -409,8 +409,7 @@ export function applyCompensationToActiveOscillators(): void {
             const target = base * sensitivity;
             if (rec.gain && rec.gain.gain) {
               // Use the gain node's context for precise scheduling when available.
-              const gctx =
-                (rec.gain as any).context ?? (rec.osc as any).context;
+              const gctx = rec.gain?.context ?? rec.osc?.context;
               const now = gctx?.currentTime;
               if (typeof now === 'number') {
                 try {
@@ -443,9 +442,13 @@ export function applyCompensationToActiveOscillators(): void {
         // Update live-preview nodes (if present) using stored base gain on mainGain.
         const live = getLiveAudioNodes(c);
         if (live && live.gain) {
-          const base = (live.gain as any).__baseGain ?? undefined;
+          // Narrow the live.gain accessor to a GainNode that may carry a debug/meta property.
+          const gainWithMeta = live.gain as
+            | (GainNode & { __baseGain?: number })
+            | undefined;
+          const base = gainWithMeta?.__baseGain ?? undefined;
           if (typeof base === 'number') {
-            const ctx = (live.gain as any).context as AudioContext | undefined;
+            const ctx = gainWithMeta?.context;
             const now = ctx?.currentTime;
             const target = base * sensitivity;
             if (typeof now === 'number') {
@@ -819,22 +822,22 @@ export function playRichTone(
   window.setTimeout(() => {
     try {
       tailDelay.disconnect();
-    } catch (err) {
+    } catch {
       // ignore errors during tail node cleanup
     }
     try {
       tailFeedback.disconnect();
-    } catch (err) {
+    } catch {
       // ignore errors during tail node cleanup
     }
     try {
       tailLP.disconnect();
-    } catch (err) {
+    } catch {
       // ignore errors during tail node cleanup
     }
     try {
       tailGain.disconnect();
-    } catch (err) {
+    } catch {
       // ignore errors during tail node cleanup
     }
   }, cleanupMs);
@@ -927,7 +930,8 @@ export function createLiveAudio(
   // Persist a baseGain marker on the gain node so runtime compensation can
   // restore/set levels for live preview nodes immediately when sensitivity changes.
   try {
-    (mainGain as any).__baseGain = scaledBaseGain;
+    (mainGain as GainNode & { __baseGain?: number }).__baseGain =
+      scaledBaseGain;
   } catch {
     // ignore if property assignment is restricted
   }

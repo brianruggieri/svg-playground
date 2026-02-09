@@ -30,6 +30,7 @@ import {
   playClickTone,
 } from './audio';
 import { createCircleAt, emotionalExit } from './circles';
+import { initGlow } from './glow';
 import {
   setSegments,
   setHoldDuration,
@@ -88,6 +89,10 @@ export function init(
   const clearBtnEl = clearBtn!;
 
   const audioCtx = options.audioCtx ?? createAudioContext();
+  const glow = initGlow(svgEl, {
+    enableDebugPanel: false,
+    persistConfig: false,
+  });
 
   // Debug window typing for filter compensation UI.
   // This gives us a typed handle instead of repeatedly casting `window as any`.
@@ -111,6 +116,7 @@ export function init(
 
   // Debug overlay state: map circles -> overlay elements
   let debugMode = false;
+
   const overlayMap = new Map<SVGCircleElement, HTMLElement>();
   let debugRaf: number | null = null;
 
@@ -373,7 +379,9 @@ export function init(
   // Toggle debug overlay with the 'D' key (case-insensitive)
   document.addEventListener('keydown', (ev) => {
     if (ev.code === 'KeyD') {
-      setDebugMode(!debugMode);
+      const next = !debugMode;
+      setDebugMode(next);
+      glow.setDebugPanelEnabled(next);
     }
   });
 
@@ -673,7 +681,7 @@ export function init(
           // clearLoopTimeout will clear the timeout and null the entry in state
           clearLoopTimeout(c);
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
       // fade live audio
@@ -724,6 +732,12 @@ export function init(
 
     clearBtnEl.removeEventListener('click', onClearClick);
 
+    try {
+      glow.destroy();
+    } catch {
+      // ignore
+    }
+
     if (rafId) {
       cancelAnimationFrame(rafId);
       rafId = null;
@@ -737,7 +751,7 @@ export function init(
         if (typeof maybeTimeout === 'number') {
           clearLoopTimeout(c);
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
       try {
@@ -749,7 +763,7 @@ export function init(
       try {
         // Stop and clear active oscillators via the state manager
         stopAndClearActiveOscillators(c);
-      } catch (err) {
+      } catch {
         // ignore
       }
       try {
@@ -757,7 +771,7 @@ export function init(
         if (nodes) {
           fadeAndCleanupLiveAudio(audioCtx, c);
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
       // Remove any per-circle debug overlay if present
