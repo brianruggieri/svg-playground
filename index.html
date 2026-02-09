@@ -1,296 +1,569 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Dash-Synced Generative Audio Circles (Immediate Clear)</title>
-<style>
-html, body {margin:0;padding:0;width:100%;height:100%;background:#111;overflow:hidden;font-family:sans-serif;}
-svg {display:block;width:100%;height:100%;cursor:crosshair;}
-.ghost {fill:none;stroke:rgba(255,255,255,0.15);stroke-width:1.5;}
-.spinner {fill:none;stroke-width:8;transform-box:fill-box;transform-origin:center;}
-@keyframes spin {to{transform:rotate(-360deg);}}
-#clearBtn {
-    position: absolute;
-    top: 20px;
-    right: 20px;
-    padding: 12px 20px;
-    font-size: 16px;
-    background: rgba(255,255,255,0.1);
-    color: #fff;
-    border: 2px solid #fff;
-    border-radius: 12px;
-    cursor: pointer;
-    backdrop-filter: blur(6px);
-    transition: all 0.2s ease;
-}
-#clearBtn:hover {
-    background: rgba(255,255,255,0.25);
-    transform: scale(1.05);
-}
-</style>
-</head>
-<body>
-<svg id="canvas"></svg>
-<button id="clearBtn">Clear</button>
-<script>
-const svg = document.getElementById("canvas");
-const radius = 60;
-const circ = 2 * Math.PI * radius;
-
-let currentCircle = null;
-let holdStart = null;
-let lastSegmentStart = null;
-let isSpaceDown = false;
-let segments = [];
-let rafId = null;
-const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-
-// ---------------- Seeded RNG ----------------
-function mulberry32(a) {
-    return function() {
-        let t = a += 0x6D2B79F5;
-        t = Math.imul(t ^ t >>> 15, t | 1);
-        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-        return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    }
-}
-
-// Random color generator
-function randomColor(){return `hsl(${Math.floor(Math.random()*360)},80%,55%)`;}
-
-// Build dash array string
-function buildDashArray(segments,liveType,liveDuration,totalDurationMs){
-    if(totalDurationMs<=0) return `0 ${circ}`;
-    const scale = circ/totalDurationMs;
-    const all = segments.slice();
-    if(liveDuration>0) all.push({type:liveType,duration:liveDuration});
-    if(all.length===0) return `0 ${circ}`;
-    const lens=all.map(s=>Math.max(1,Math.round(s.duration*scale)));
-    const out=[];
-    if(all[0].type==='gap'){ out.push(0,lens[0]); for(let i=1;i<lens.length;i++) out.push(lens[i]);}
-    else{for(let i=0;i<lens.length;i++) out.push(lens[i]);}
-    return out.join(' ');
-}
-
-// ---------------- Rich Tone ----------------
-function playRichTone(freq, pan, duration, yFactor, startTime, rng, circle){
-    const gain = audioCtx.createGain();
-    gain.gain.value = 0.15 + yFactor*0.2;
-    const panner = new StereoPannerNode(audioCtx, {pan});
-    const filter = audioCtx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 500 + yFactor*5000;
-    filter.connect(gain);
-    gain.connect(panner);
-    panner.connect(audioCtx.destination);
-
-    const detunes = [0,5,-5];
-    detunes.forEach(d=>{
-        const osc = audioCtx.createOscillator();
-        const waveforms = ['sine','square','triangle','sawtooth'];
-        osc.type = waveforms[Math.floor(rng()*4)];
-        osc.frequency.value = freq * (0.95 + rng()*0.1);
-        osc.connect(filter);
-        osc.start(startTime);
-        osc.stop(startTime + duration);
-        circle._activeOscillators = circle._activeOscillators || [];
-        circle._activeOscillators.push(osc);
-    });
-}
-
-// ---------------- Noise ----------------
-function playNoise(duration, pan, circle){
-    const bufferSize = audioCtx.sampleRate * duration;
-    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
-    const data = buffer.getChannelData(0);
-    for(let i=0;i<bufferSize;i++) data[i] = Math.random()*2-1;
-    const source = audioCtx.createBufferSource();
-    source.buffer = buffer;
-    const gainNode = audioCtx.createGain();
-    gainNode.gain.value = 0.05 + Math.random()*0.05;
-    const panner = new StereoPannerNode(audioCtx, {pan});
-    source.connect(gainNode); gainNode.connect(panner); panner.connect(audioCtx.destination);
-    source.start(audioCtx.currentTime);
-    circle._activeOscillators = circle._activeOscillators || [];
-    circle._activeOscillators.push(source);
-}
-
-// ---------------- Live preview ----------------
-function startLivePreview(){
-    const tick = () => {
-        if(!currentCircle) return;
-        const now = performance.now();
-        const liveDuration= lastSegmentStart ? now - lastSegmentStart : 0;
-        const total=now-holdStart;
-        const dashArray=buildDashArray(segments,isSpaceDown?'dash':'gap',liveDuration,total);
-        currentCircle.setAttribute('stroke-dasharray',dashArray);
-        currentCircle.setAttribute('stroke-dashoffset',0.5);
-        rafId = requestAnimationFrame(tick);
-    };
-    rafId = requestAnimationFrame(tick);
-}
-
-// ---------------- Loop audio per circle ----------------
-function loopCircleAudio(circle){
-    const rotationPeriod = circle._holdDuration / 1000; // seconds per full rotation
-    const dashArray = circle.getAttribute('stroke-dasharray').split(' ').map(Number);
-    const totalLength = dashArray.reduce((a,b)=>a+b,0);
-    const segmentsLoop = dashArray.map((len,i)=>({type: i%2===0?'dash':'gap', length: len}));
-
-    const x = circle._pos.x;
-    const y = circle._pos.y;
-    const pan = (x/window.innerWidth)*2 - 1;
-    const yFactor = y/window.innerHeight;
-    const scale = [220,247,277,294,330,370,415,440];
-
-    function scheduleLoopAhead(){
-        let t = audioCtx.currentTime + 0.05;
-        segmentsLoop.forEach((seg)=>{
-            const dur = (seg.length/totalLength)*rotationPeriod;
-            if(seg.type==='dash' && dur>0){
-                const noteIndex = Math.floor(circle._rng()*scale.length);
-                const freq = scale[noteIndex]*(0.95 + circle._rng()*0.1);
-                playRichTone(freq, pan, dur, yFactor, t, circle._rng, circle);
-            } else if(seg.type==='gap' && dur>0.02){
-                // playNoise(dur, pan, circle);
+    <head>
+        <meta charset="UTF-8" />
+        <title>Dash‑Synced Generative Audio Circles</title>
+        <style>
+            :root {
+                color-scheme: dark;
             }
-            t += dur;
-        });
-        circle._loopTimeout = setTimeout(scheduleLoopAhead, (rotationPeriod-0.05)*1000);
-    }
-    scheduleLoopAhead();
-}
+            html,
+            body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+                background: #111;
+                overflow: hidden;
+                font-family: sans-serif;
+            }
+            svg {
+                display: block;
+                width: 100%;
+                height: 100%;
+                cursor: crosshair;
+            }
+            .ghost {
+                fill: none;
+                stroke: rgba(255, 255, 255, 0.15);
+                stroke-width: 1.5;
+            }
+            .spinner {
+                fill: none;
+                stroke-width: 8;
+                transform-box: fill-box;
+                transform-origin: center;
+            }
+            @keyframes spin {
+                to {
+                    transform: rotate(-360deg);
+                }
+            }
 
-// ---------------- Mouse events ----------------
-svg.addEventListener("mousedown", e=>{
-    const pt=svg.createSVGPoint(); pt.x=e.clientX; pt.y=e.clientY;
-    const loc=pt.matrixTransform(svg.getScreenCTM().inverse());
+            #clearBtn {
+                position: absolute;
+                top: 20px;
+                right: 20px;
+                padding: 12px 20px;
+                font-size: 16px;
+                background: rgba(255, 255, 255, 0.1);
+                color: #fff;
+                border: 2px solid #fff;
+                border-radius: 12px;
+                cursor: pointer;
+                backdrop-filter: blur(6px);
+                transition: all 0.2s ease;
+            }
+            #clearBtn:hover {
+                background: rgba(255, 255, 255, 0.25);
+                transform: scale(1.05);
+            }
+        </style>
+    </head>
+    <body>
+        <svg id="canvas"></svg>
+        <button id="clearBtn">Clear</button>
 
-    // Ghost outline
-    const ghost=document.createElementNS("http://www.w3.org/2000/svg","circle");
-    ghost.setAttribute("cx",loc.x); ghost.setAttribute("cy",loc.y); ghost.setAttribute("r",radius);
-    ghost.classList.add("ghost"); svg.appendChild(ghost);
+        <script>
+            /**
+             * Dash‑Synced Generative Audio Circles
+             * ----------------------------------
+             * UX:
+             *  - Mousedown to place a circle.
+             *  - Hold mouse to record total duration (sets rotation period).
+             *  - Press/hold Space while recording to mark dash segments (audible).
+             *  - Release mouse to finalize circle + loop its audio.
+             *
+             * Implementation overview:
+             *  - Mouse hold is segmented into dash/gap durations.
+             *  - Segments map to an SVG stroke‑dasharray and to audio notes.
+             *  - Each circle is self‑contained with cleanup for audio nodes/timeouts.
+             */
 
-    // Current circle
-    currentCircle=document.createElementNS("http://www.w3.org/2000/svg","circle");
-    currentCircle.setAttribute("cx",loc.x); currentCircle.setAttribute("cy",loc.y); currentCircle.setAttribute("r",radius);
-    currentCircle.classList.add("spinner");
-    currentCircle.style.stroke=randomColor();
-    currentCircle.setAttribute('stroke-dasharray', `0 ${circ}`);
-    currentCircle.setAttribute('stroke-dashoffset',0.5);
-    currentCircle._pos={x:loc.x,y:loc.y};
+            /* ----------------------------- DOM & Constants ----------------------------- */
+            const svg = document.getElementById("canvas");
+            const clearBtn = document.getElementById("clearBtn");
+            const audioCtx = new (
+                window.AudioContext || window.webkitAudioContext
+            )();
 
-    // Seeded RNG
-    const seed = Math.floor(loc.x*1000 + loc.y*1000 + performance.now());
-    currentCircle._rng = mulberry32(seed);
+            const CIRCLE_RADIUS = 60;
+            const CIRCLE_CIRCUMFERENCE = 2 * Math.PI * CIRCLE_RADIUS;
+            const LIVE_AUDIO_FADE_SEC = 0.05;
+            const LOOP_SCHEDULE_AHEAD_SEC = 0.05;
 
-    svg.appendChild(currentCircle);
+            const SCALES = {
+                pentatonic: [220, 247, 277, 330, 370],
+                major: [220, 247, 277, 294, 330, 370, 415, 440],
+                minor: [220, 233, 277, 294, 330, 349, 415, 440],
+            };
 
-    holdStart=performance.now();
-    lastSegmentStart=holdStart;
-    segments=[];
-    isSpaceDown=false;
-    startLivePreview();
-});
+            /* ------------------------------ Global State ------------------------------- */
+            let currentCircle = null;
+            let holdStart = null;
+            let lastSegmentStart = null;
+            let isSpaceDown = false;
+            let segments = [];
+            let rafId = null;
 
-svg.addEventListener("mouseup", ()=>{
-    if(!currentCircle) return;
-    const now=performance.now();
-    segments.push({type:isSpaceDown?'dash':'gap',duration:now-lastSegmentStart});
-    const total=now-holdStart;
-    const dashArray=buildDashArray(segments,null,0,total);
-    currentCircle.setAttribute('stroke-dasharray', dashArray);
-    currentCircle.setAttribute('stroke-dashoffset',0.5);
-    // Use hold duration to set spin speed
-    currentCircle.style.animation = `spin ${total/1000}s linear infinite`;
+            /* ----------------------------- Utility Helpers ----------------------------- */
+            /** Simple seeded RNG for deterministic variations per circle. */
+            function mulberry32(seed) {
+                return function () {
+                    let t = (seed += 0x6d2b79f5);
+                    t = Math.imul(t ^ (t >>> 15), t | 1);
+                    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+                };
+            }
 
-    currentCircle._segments=segments.slice();
-    currentCircle._holdDuration=total;
-    loopCircleAudio(currentCircle);
+            function randomColor() {
+                return `hsl(${Math.floor(Math.random() * 360)}, 80%, 55%)`;
+            }
 
-    cancelAnimationFrame(rafId);
-    currentCircle=null;
-    segments=[];
-    isSpaceDown=false;
-    holdStart=null;
-    lastSegmentStart=null;
-});
+            function toSvgPoint(evt) {
+                const pt = svg.createSVGPoint();
+                pt.x = evt.clientX;
+                pt.y = evt.clientY;
+                return pt.matrixTransform(svg.getScreenCTM().inverse());
+            }
 
-// ---------------- Spacebar events ----------------
-document.addEventListener("keydown", e=>{
-    if(e.code==="Space" && currentCircle && !isSpaceDown){
-        const now = performance.now();
-        segments.push({type:'gap',duration:now-lastSegmentStart});
-        lastSegmentStart=now;
-        isSpaceDown=true;
+            /**
+             * Convert recorded segments + optional live segment into an SVG dasharray.
+             * @param {Array<{type:'dash'|'gap', duration:number}>} segments
+             * @param {'dash'|'gap'|null} liveType
+             * @param {number} liveDuration
+             * @param {number} totalDurationMs
+             */
+            function buildDashArray(
+                segments,
+                liveType,
+                liveDuration,
+                totalDurationMs,
+            ) {
+                if (totalDurationMs <= 0) return `0 ${CIRCLE_CIRCUMFERENCE}`;
 
-        // Start sustained note
-        const x = currentCircle._pos.x;
-        const y = currentCircle._pos.y;
-        const pan = (x/window.innerWidth)*2-1;
-        const yFactor = y/window.innerHeight;
-        const scale = [220,247,277,294,330,370,415,440];
-        const noteIndex = Math.floor(currentCircle._rng()*scale.length);
-        const freq = scale[noteIndex]*(0.95 + currentCircle._rng()*0.1);
+                const scale = CIRCLE_CIRCUMFERENCE / totalDurationMs;
+                const all = segments.slice();
+                if (liveDuration > 0 && liveType) {
+                    all.push({ type: liveType, duration: liveDuration });
+                }
+                if (all.length === 0) return `0 ${CIRCLE_CIRCUMFERENCE}`;
 
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        gain.gain.value = 0.15 + yFactor*0.2;
-        const panner = new StereoPannerNode(audioCtx, {pan});
-        osc.type = ['sine','square','triangle','sawtooth'][Math.floor(currentCircle._rng()*4)];
-        osc.frequency.value = freq;
+                // Ensure each dash/gap is visible by clamping to at least 1 unit.
+                const lens = all.map((s) =>
+                    Math.max(1, Math.round(s.duration * scale)),
+                );
+                const out = [];
 
-        osc.connect(gain); gain.connect(panner); panner.connect(audioCtx.destination);
-        osc.start();
-        currentCircle._liveOsc = osc;
+                // SVG dasharray starts with dash length; if first segment is a gap, insert a 0 dash.
+                if (all[0].type === "gap") {
+                    out.push(0, lens[0]);
+                    for (let i = 1; i < lens.length; i++) out.push(lens[i]);
+                } else {
+                    for (let i = 0; i < lens.length; i++) out.push(lens[i]);
+                }
 
-        e.preventDefault();
-    }
-});
+                return out.join(" ");
+            }
 
-document.addEventListener("keyup", e=>{
-    if(e.code==="Space" && currentCircle && isSpaceDown){
-        const now = performance.now();
-        segments.push({type:'dash',duration:now-lastSegmentStart});
-        lastSegmentStart=now;
-        isSpaceDown=false;
+            /**
+             * Analyze dash/gap sequence to steer synthesis parameters.
+             * @param {Array<{type:'dash'|'gap', length:number}>} segments
+             * @param {number} totalLength
+             */
+            function analyzeSegments(segments, totalLength) {
+                const counts = { dash: 0, gap: 0 };
+                const avgLengths = { dash: 0, gap: 0 };
 
-        if(currentCircle._liveOsc){
-            currentCircle._liveOsc.stop();
-            currentCircle._liveOsc.disconnect();
-            currentCircle._liveOsc = null;
-        }
-        e.preventDefault();
-    }
-});
+                segments.forEach((seg) => {
+                    counts[seg.type]++;
+                    avgLengths[seg.type] += seg.length;
+                });
 
-// ---------------- Clear button ----------------
-const clearBtn = document.getElementById('clearBtn');
-clearBtn.addEventListener('click', ()=>{
-    Array.from(svg.querySelectorAll('circle')).forEach(c=>{
-        // Stop live oscillator
-        if(c._liveOsc){
-            try { c._liveOsc.stop(); } catch(e){}
-            c._liveOsc.disconnect();
-            c._liveOsc = null;
-        }
-        // Stop all active oscillators mid-loop
-        if(c._activeOscillators){
-            c._activeOscillators.forEach(o=>{
-                try { o.stop(); } catch(e){}
-                o.disconnect();
+                avgLengths.dash = avgLengths.dash / (counts.dash || 1);
+                avgLengths.gap = avgLengths.gap / (counts.gap || 1);
+
+                return {
+                    complexity: segments.length,
+                    dashGapRatio: counts.dash / (counts.gap || 1),
+                    avgDashLength: avgLengths.dash / totalLength,
+                    avgGapLength: avgLengths.gap / totalLength,
+                };
+            }
+
+            function chooseScale(analysis) {
+                if (analysis.complexity <= 4) return SCALES.pentatonic;
+                return analysis.dashGapRatio > 1 ? SCALES.major : SCALES.minor;
+            }
+
+            /* ------------------------------- Audio Core -------------------------------- */
+            /**
+             * Build a small harmonic stack and play a single note segment.
+             * This is used by the looping playback for finalized circles.
+             */
+            function playRichTone(
+                freq,
+                pan,
+                duration,
+                yFactor,
+                startTime,
+                rng,
+                circle,
+                analysis,
+            ) {
+                const gain = audioCtx.createGain();
+                gain.gain.value = 0.1 + yFactor * 0.3;
+
+                const harmonics = 1 + Math.floor(analysis.complexity / 3);
+                const detunes = Array.from(
+                    { length: harmonics },
+                    (_, i) => i * 5 * (rng() > 0.5 ? 1 : -1),
+                );
+
+                const attackTime = analysis.avgDashLength * 0.1;
+                gain.gain.setValueAtTime(0, startTime);
+                gain.gain.linearRampToValueAtTime(
+                    gain.gain.value,
+                    startTime + attackTime,
+                );
+                gain.gain.linearRampToValueAtTime(0, startTime + duration);
+
+                const filter = audioCtx.createBiquadFilter();
+                filter.frequency.value = 500 + pan * 2000 + yFactor * 3000;
+                filter.Q.value = 1 + analysis.dashGapRatio * 5;
+
+                const panner = new StereoPannerNode(audioCtx, { pan });
+
+                filter.connect(gain);
+                gain.connect(panner);
+                panner.connect(audioCtx.destination);
+
+                detunes.forEach((detune) => {
+                    const osc = audioCtx.createOscillator();
+                    osc.type =
+                        analysis.avgDashLength > 0.2 ? "sine" : "triangle";
+                    osc.frequency.value = freq * (1 + detune / 1200);
+                    osc.connect(filter);
+                    osc.start(startTime);
+                    osc.stop(startTime + duration);
+                    circle._activeOscillators = circle._activeOscillators || [];
+                    circle._activeOscillators.push(osc);
+                });
+            }
+
+            /**
+             * Create live audio while the user is actively holding Space.
+             * Returns a node bundle for later cleanup.
+             */
+            function createLiveAudio(circle, analysis, noteScale) {
+                const x = circle._pos.x;
+                const y = circle._pos.y;
+                const pan = (x / window.innerWidth) * 2 - 1;
+                const yFactor = y / window.innerHeight;
+
+                const noteIndex = Math.floor(circle._rng() * noteScale.length);
+                const baseFreq = noteScale[noteIndex];
+
+                const mainGain = audioCtx.createGain();
+                mainGain.gain.value = 0.1 + yFactor * 0.3;
+
+                const filter = audioCtx.createBiquadFilter();
+                filter.frequency.value = 500 + pan * 2000 + yFactor * 3000;
+                filter.Q.value = 1 + analysis.dashGapRatio * 5;
+
+                const panner = new StereoPannerNode(audioCtx, { pan });
+                filter.connect(mainGain);
+                mainGain.connect(panner);
+                panner.connect(audioCtx.destination);
+
+                const harmonics = 1 + Math.floor(analysis.complexity / 3);
+                const detunes = Array.from(
+                    { length: harmonics },
+                    (_, i) => i * 5 * (circle._rng() > 0.5 ? 1 : -1),
+                );
+
+                const oscillators = detunes.map((detune) => {
+                    const osc = audioCtx.createOscillator();
+                    osc.type =
+                        analysis.avgDashLength > 0.2 ? "sine" : "triangle";
+                    osc.frequency.value = baseFreq * (1 + detune / 1200);
+                    osc.connect(filter);
+                    osc.start();
+                    return osc;
+                });
+
+                return { gain: mainGain, filter, panner, oscillators };
+            }
+
+            function fadeAndCleanupLiveAudio(circle) {
+                if (!circle._liveAudioNodes) return;
+                const now = audioCtx.currentTime;
+
+                circle._liveAudioNodes.gain.gain.linearRampToValueAtTime(
+                    0,
+                    now + LIVE_AUDIO_FADE_SEC,
+                );
+
+                setTimeout(
+                    () => {
+                        const nodes = circle._liveAudioNodes;
+                        if (!nodes) return;
+                        nodes.oscillators.forEach((osc) => {
+                            osc.stop();
+                            osc.disconnect();
+                        });
+                        nodes.filter.disconnect();
+                        nodes.gain.disconnect();
+                        nodes.panner.disconnect();
+                        circle._liveAudioNodes = null;
+                    },
+                    LIVE_AUDIO_FADE_SEC * 1000 + 10,
+                );
+            }
+
+            /* ------------------------------ Loop Playback ------------------------------ */
+            /**
+             * Convert dasharray to segments and schedule looping playback.
+             * The circle stores its timeout so it can be canceled on clear.
+             */
+            function loopCircleAudio(circle) {
+                const rotationPeriod = circle._holdDuration / 1000;
+                const dashArray = circle
+                    .getAttribute("stroke-dasharray")
+                    .split(" ")
+                    .map(Number);
+                const totalLength = dashArray.reduce((a, b) => a + b, 0);
+                const segmentsLoop = dashArray.map((len, i) => ({
+                    type: i % 2 === 0 ? "dash" : "gap",
+                    length: len,
+                }));
+
+                const analysis = analyzeSegments(segmentsLoop, totalLength);
+                const scale = chooseScale(analysis);
+
+                const x = circle._pos.x;
+                const y = circle._pos.y;
+                const pan = (x / window.innerWidth) * 2 - 1;
+                const yFactor = y / window.innerHeight;
+
+                function scheduleLoopAhead() {
+                    let t = audioCtx.currentTime + LOOP_SCHEDULE_AHEAD_SEC;
+
+                    segmentsLoop.forEach((seg) => {
+                        const dur = (seg.length / totalLength) * rotationPeriod;
+                        if (seg.type === "dash" && dur > 0) {
+                            const noteIndex = Math.floor(
+                                circle._rng() * scale.length,
+                            );
+                            const freq =
+                                scale[noteIndex] *
+                                (0.995 + circle._rng() * 0.01);
+                            playRichTone(
+                                freq,
+                                pan,
+                                dur,
+                                yFactor,
+                                t,
+                                circle._rng,
+                                circle,
+                                analysis,
+                            );
+                        }
+                        t += dur;
+                    });
+
+                    circle._loopTimeout = setTimeout(
+                        scheduleLoopAhead,
+                        (rotationPeriod - LOOP_SCHEDULE_AHEAD_SEC) * 1000,
+                    );
+                }
+
+                scheduleLoopAhead();
+            }
+
+            /* ------------------------------ Live Preview ------------------------------- */
+            function startLivePreview() {
+                const tick = () => {
+                    if (!currentCircle) return;
+                    const now = performance.now();
+                    const liveDuration = lastSegmentStart
+                        ? now - lastSegmentStart
+                        : 0;
+                    const total = now - holdStart;
+                    const dashArray = buildDashArray(
+                        segments,
+                        isSpaceDown ? "dash" : "gap",
+                        liveDuration,
+                        total,
+                    );
+
+                    currentCircle.setAttribute("stroke-dasharray", dashArray);
+                    currentCircle.setAttribute("stroke-dashoffset", 0.5);
+
+                    rafId = requestAnimationFrame(tick);
+                };
+                rafId = requestAnimationFrame(tick);
+            }
+
+            /* ------------------------------ Circle Setup ------------------------------- */
+            function createCircleAt(loc) {
+                // Ghost outline
+                const ghost = document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "circle",
+                );
+                ghost.setAttribute("cx", loc.x);
+                ghost.setAttribute("cy", loc.y);
+                ghost.setAttribute("r", CIRCLE_RADIUS);
+                ghost.classList.add("ghost");
+                svg.appendChild(ghost);
+
+                // Actual circle
+                const circle = document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "circle",
+                );
+                circle.setAttribute("cx", loc.x);
+                circle.setAttribute("cy", loc.y);
+                circle.setAttribute("r", CIRCLE_RADIUS);
+                circle.classList.add("spinner");
+                circle.style.stroke = randomColor();
+                circle.setAttribute(
+                    "stroke-dasharray",
+                    `0 ${CIRCLE_CIRCUMFERENCE}`,
+                );
+                circle.setAttribute("stroke-dashoffset", 0.5);
+
+                circle._pos = { x: loc.x, y: loc.y };
+                circle._rng = mulberry32(
+                    Math.floor(loc.x * 1000 + loc.y * 1000 + performance.now()),
+                );
+
+                svg.appendChild(circle);
+                return circle;
+            }
+
+            /* ------------------------------ Event Handlers ----------------------------- */
+            svg.addEventListener("mousedown", (e) => {
+                const loc = toSvgPoint(e);
+                currentCircle = createCircleAt(loc);
+
+                holdStart = performance.now();
+                lastSegmentStart = holdStart;
+                segments = [];
+                isSpaceDown = false;
+
+                startLivePreview();
             });
-            c._activeOscillators = [];
-        }
-        // Stop loop timeouts
-        if(c._loopTimeout) {
-            clearTimeout(c._loopTimeout);
-            c._loopTimeout = null;
-        }
-        // Remove circle
-        c.remove();
-    });
-});
-</script>
-</body>
+
+            svg.addEventListener("mouseup", () => {
+                if (!currentCircle) return;
+
+                const now = performance.now();
+                segments.push({
+                    type: isSpaceDown ? "dash" : "gap",
+                    duration: now - lastSegmentStart,
+                });
+
+                const total = now - holdStart;
+                const dashArray = buildDashArray(segments, null, 0, total);
+
+                // If live audio is playing, fade it out immediately.
+                fadeAndCleanupLiveAudio(currentCircle);
+
+                currentCircle.setAttribute("stroke-dasharray", dashArray);
+                currentCircle.setAttribute("stroke-dashoffset", 0.5);
+                currentCircle.style.animation = `spin ${total / 1000}s linear infinite`;
+
+                currentCircle._segments = segments.slice();
+                currentCircle._holdDuration = total;
+                loopCircleAudio(currentCircle);
+
+                cancelAnimationFrame(rafId);
+                currentCircle = null;
+                segments = [];
+                isSpaceDown = false;
+                holdStart = null;
+                lastSegmentStart = null;
+            });
+
+            document.addEventListener("keydown", (e) => {
+                if (e.code !== "Space" || !currentCircle || isSpaceDown) return;
+
+                const now = performance.now();
+                segments.push({
+                    type: "gap",
+                    duration: now - lastSegmentStart,
+                });
+                lastSegmentStart = now;
+                isSpaceDown = true;
+
+                const totalDuration = now - holdStart;
+                const scale = CIRCLE_CIRCUMFERENCE / totalDuration;
+                const currentSegments = segments.map((s) => ({
+                    ...s,
+                    length: Math.max(1, Math.round(s.duration * scale)),
+                }));
+                const analysis = analyzeSegments(
+                    currentSegments,
+                    CIRCLE_CIRCUMFERENCE,
+                );
+                const noteScale = chooseScale(analysis);
+
+                currentCircle._liveAudioNodes = createLiveAudio(
+                    currentCircle,
+                    analysis,
+                    noteScale,
+                );
+
+                e.preventDefault();
+            });
+
+            document.addEventListener("keyup", (e) => {
+                if (e.code !== "Space" || !currentCircle || !isSpaceDown)
+                    return;
+
+                const now = performance.now();
+                segments.push({
+                    type: "dash",
+                    duration: now - lastSegmentStart,
+                });
+                lastSegmentStart = now;
+                isSpaceDown = false;
+
+                fadeAndCleanupLiveAudio(currentCircle);
+                e.preventDefault();
+            });
+
+            /* ------------------------------ Clear All --------------------------------- */
+            clearBtn.addEventListener("click", () => {
+                Array.from(svg.querySelectorAll("circle")).forEach((c) => {
+                    // Stop any loop scheduling
+                    if (c._loopTimeout) {
+                        clearTimeout(c._loopTimeout);
+                        c._loopTimeout = null;
+                    }
+
+                    // Stop live audio
+                    if (c._liveAudioNodes) {
+                        fadeAndCleanupLiveAudio(c);
+                    }
+
+                    // Stop active oscillators
+                    if (c._activeOscillators) {
+                        c._activeOscillators.forEach((o) => {
+                            try {
+                                o.stop();
+                            } catch (_) {}
+                            o.disconnect();
+                        });
+                        c._activeOscillators = [];
+                    }
+
+                    c.remove();
+                });
+            });
+        </script>
+    </body>
 </html>
