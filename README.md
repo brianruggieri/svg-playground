@@ -1,25 +1,25 @@
 # Dash‑Synced Generative Audio Circles
 
-A single‑page SVG + Web Audio experiment that lets you “draw” rhythmic dash patterns by holding the mouse and pressing Space. Each circle becomes a looping audio pattern whose tone and timbre are derived from the dash/gap structure.
+A single‑page SVG + Web Audio experiment that lets you “draw” rhythmic dash patterns by using pointer input (mouse/touch/stylus) and pressing Space. Each circle becomes a looping audio pattern whose tone and timbre are derived from the dash/gap structure.
 
 ## Usage
 
 1. Open `index.html` in a modern browser (Chrome, Edge, Safari).
-2. **Mouse down** to place a circle.
-3. **Hold the mouse** to define the loop duration (longer hold = slower rotation).
-4. **Press and hold Space** while still holding the mouse to create *dash* segments (audible).
+2. **Pointer down** to place a circle.
+3. **Hold the pointer** to define the loop duration (longer hold = slower rotation).
+4. **Press and hold Space** while still holding the pointer to create *dash* segments (audible).
 5. **Release Space** to return to *gap* segments (silent).
-6. **Mouse up** to finalize the circle. The dash pattern loops visually and sonically.
+6. **Pointer up** to finalize the circle. The dash pattern loops visually and sonically.
 7. Click **Clear** to stop all audio and remove all circles.
 
-> Note: Browsers require a user gesture to start audio. If sound is muted, click once on the page and try again.
+> Note: Browsers require a user gesture to start audio. If sound is muted, interact with the page (e.g., a single tap/click) and try again.
 
 ## How It Works (Architecture)
 
 The app is split into ES modules, organized into focused areas:
 
 - **Geometry & State**
-  - Tracks `segments` (dash/gap durations) while the mouse is held.
+  - Tracks `segments` (dash/gap durations) while the pointer is held.
   - Converts segments into an SVG `stroke-dasharray` so the circle visually represents the rhythm.
 
 - **Live Preview**
@@ -28,7 +28,7 @@ The app is split into ES modules, organized into focused areas:
 
 - **Audio**
   - **Live Audio**: While Space is held, the app plays a sustained tone derived from the current segment analysis.
-  - **Loop Audio**: After mouse up, the dasharray is converted into timed segments. Each dash triggers a note.
+  - **Loop Audio**: After pointer up, the dasharray is converted into timed segments. Each dash triggers a note.
   - The **scale selection** and **harmonic content** depend on complexity:
     - Fewer segments → pentatonic.
     - More dashes than gaps → major.
@@ -45,7 +45,7 @@ The app is split into ES modules, organized into focused areas:
   - `dash` segments are audible and visible.
   - `gap` segments are silent and just visual spacing.
 - **Rotation**
-  - The total mouse‑hold duration becomes the animation period for the spinner.
+  - The total pointer‑hold duration becomes the animation period for the spinner.
 - **Timing**
   - Segment durations are normalized to the circle circumference, then rescaled to time.
 

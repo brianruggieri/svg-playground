@@ -1,0 +1,61 @@
+{
+  // Editor behavior
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": true,
+    "source.organizeImports": true
+  },
+
+  // Prefer workspace TypeScript version (if available)
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+  "typescript.preferences.importModuleSpecifier": "relative",
+
+  // Linting
+  "eslint.enable": true,
+  "eslint.packageManager": "npm",
+  "eslint.validate": [
+    "javascript",
+    "javascriptreact",
+    "typescript",
+    "typescriptreact"
+  ],
+
+  // Prettier
+  "prettier.requireConfig": true,
+
+  // Files / watchers
+  "files.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/gh-pages": true,
+    "**/.cache": true,
+    "**/.git": false
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/dist/**": true
+  },
+
+  // Enable helpful suggestions for import paths
+  "javascript.suggest.autoImports": true,
+  "typescript.suggest.autoImports": true,
+
+  // Workspace specific TypeScript validation (avoid duplicate diagnostics)
+  "typescript.validate.enable": true,
+  "javascript.validate.enable": false,
+
+  // Enable semantic highlighting where supported
+  "editor.semanticHighlighting.enabled": true,
+
+  // Editor tab/indent preferences (align with Prettier defaults)
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+
+  // Quick open/Go to settings for workspace
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true
+  }
+}

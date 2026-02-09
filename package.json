@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lint": "eslint \"js/**/*.{ts,js}\"",
+    "lint:fix": "eslint \"js/**/*.{ts,js}\" --fix",
+    "format": "prettier --write \"**/*.{ts,js,json,md,css,html}\""
   },
   "keywords": [
     "svg",
@@ -16,9 +19,41 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "vite": "^5.4.21"
+    "vite": "^5.4.21",
+    "eslint": "^8.50.0",
+    "prettier": "^3.0.0",
+    "eslint-config-prettier": "^8.8.0",
+    "eslint-plugin-prettier": "^5.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0"
   },
   "engines": {
     "node": ">=20.17.0"
+  },
+  "eslintConfig": {
+    "root": true,
+    "parser": "@typescript-eslint/parser",
+    "parserOptions": {
+      "ecmaVersion": 2022,
+      "sourceType": "module"
+    },
+    "plugins": [
+      "@typescript-eslint",
+      "prettier"
+    ],
+    "extends": [
+      "eslint:recommended",
+      "plugin:@typescript-eslint/recommended",
+      "plugin:prettier/recommended"
+    ],
+    "rules": {
+      "prettier/prettier": "error"
+    }
+  },
+  "prettier": {
+    "semi": true,
+    "singleQuote": true,
+    "trailingComma": "es5",
+    "printWidth": 80
   }
 }

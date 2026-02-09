@@ -64,6 +64,16 @@
         <svg id="canvas"></svg>
         <button id="clearBtn">Clear</button>
 
-        <script type="module" src="js/app.js"></script>
+        <script type="module">
+            import { init } from "./js/app.ts";
+            // Mount into the body. If you want a different container, pass a selector or element.
+            if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", () =>
+                    init(document.body),
+                );
+            } else {
+                init(document.body);
+            }
+        </script>
     </body>
 </html>

@@ -1,0 +1,45 @@
+name: Lint and Format Checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: ESLint & Prettier
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Show Node/npm versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        # Fail the job on any warnings as well (--max-warnings=0)
+        run: npx eslint "js/**/*.{ts,js}" --max-warnings=0
+
+      - name: Check formatting with Prettier
+        # Prettier is installed as a devDependency. Use --check to fail if formatting differs.
+        run: npx prettier --check "**/*.{ts,js,json,md,css,html}"
+
+      - name: Success
+        if: ${{ success() }}
+        run: echo "Lint and format checks passed."
