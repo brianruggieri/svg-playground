@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"js/**/*.{ts,js}\"",
     "lint:fix": "eslint \"js/**/*.{ts,js}\" --fix",
-    "format": "prettier --write \"**/*.{ts,js,json,md,css,html}\""
+    "format": "prettier --write \"**/*.{ts,js,json,md,css,html}\"",
+    "prepare": "husky install"
   },
   "keywords": [
     "svg",
@@ -27,7 +28,9 @@
     "eslint-plugin-prettier": "^5.5.5",
     "@typescript-eslint/eslint-plugin": "^8.55.0",
     "@typescript-eslint/parser": "^8.55.0",
-    "typescript": "5.4.5"
+    "typescript": "5.4.5",
+    "husky": "^8.0.3",
+    "lint-staged": "^14.0.0"
   },
   "engines": {
     "node": ">=20.17.0"
@@ -57,5 +60,21 @@
     "singleQuote": true,
     "trailingComma": "es5",
     "printWidth": 80
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "npx --no -- lint-staged"
+    }
+  },
+  "lint-staged": {
+    "*.{ts,js}": [
+      "eslint --fix",
+      "prettier --write",
+      "git add"
+    ],
+    "*.{json,md,css,html}": [
+      "prettier --write",
+      "git add"
+    ]
   }
 }
