@@ -7,8 +7,8 @@ A single‑page SVG + Web Audio experiment that lets you “draw” rhythmic das
 1. Open `index.html` in a modern browser (Chrome, Edge, Safari).
 2. **Pointer down** to place a circle.
 3. **Hold the pointer** to define the loop duration (longer hold = slower rotation).
-4. **Press and hold Space** while still holding the pointer to create *dash* segments (audible).
-5. **Release Space** to return to *gap* segments (silent).
+4. **Press and hold Space** while still holding the pointer to create _dash_ segments (audible).
+5. **Release Space** to return to _gap_ segments (silent).
 6. **Pointer up** to finalize the circle. The dash pattern loops visually and sonically.
 7. Click **Clear** to stop all audio and remove all circles.
 
@@ -72,26 +72,32 @@ The app is split into ES modules, organized into focused areas:
 This project now uses Vite as the recommended development server for native ES module workflows (fast start, HMR, and an optimized production build).
 
 - Install dependencies (Node >= 20.17.0 is recommended):
-```
+
+```bash
 npm install
 ```
 
 - Start the Vite dev server:
-```
+
+```bash
 npm run dev
 ```
+
 By default Vite listens on port 5173; to override the port set the PORT environment variable:
-```
+
+```bash
 PORT=3000 npm run dev
 ```
 
 - Build production assets:
-```
+
+```bash
 npm run build
 ```
 
 - Preview the production build locally:
-```
+
+```bash
 npm run preview
 ```
 
