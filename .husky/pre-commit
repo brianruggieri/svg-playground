@@ -1,2 +1,3 @@
 #!/bin/sh
 npx --no -- lint-staged
+npx --no -- lint-staged
