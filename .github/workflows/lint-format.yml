@@ -1,0 +1,46 @@
+name: Lint & Format
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'svg-playground/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'svg-playground/**'
+
+jobs:
+  lint-format:
+    name: Run Prettier check and ESLint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: svg-playground
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prettier - check formatting
+        # Use the same patterns used locally to ensure parity
+        run: npx prettier --check "**/*.{ts,js,json,md,css,html}"
+
+      - name: ESLint - run lint
+        run: npm run lint
+
+      - name: Typecheck (optional, helpful safety net)
+        if: success()
+        run: npm run typecheck
