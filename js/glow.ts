@@ -514,12 +514,15 @@ function createDebugPanel(state: GlowState): HTMLDivElement {
 
       if (blurVal) blurVal.textContent = String(state.config.blur);
       if (opVal) opVal.textContent = state.config.opacityMultiplier.toFixed(2);
-      if (scaleVal)
+      if (scaleVal) {
         scaleVal.textContent = state.config.scaleMultiplier.toFixed(2);
-      if (pulseDurVal)
+      }
+      if (pulseDurVal) {
         pulseDurVal.textContent = String(state.config.pulseDuration);
-      if (throttleVal)
+      }
+      if (throttleVal) {
         throttleVal.textContent = String(state.config.throttleMs);
+      }
       if (maxVal) maxVal.textContent = String(state.config.maxConcurrent);
 
       applyFilterConfig(state);

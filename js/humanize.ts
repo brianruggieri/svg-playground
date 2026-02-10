@@ -90,8 +90,9 @@ export function simpleGrooveFromSegments(
   targetSubdivisionCount: number
 ): number[] {
   if (targetSubdivisionCount <= 0) return [];
-  if (!segmentsMs || segmentsMs.length === 0)
+  if (!segmentsMs || segmentsMs.length === 0) {
     return new Array(targetSubdivisionCount).fill(0);
+  }
 
   // Compute average segment length and use that to create a subtle alternating groove
   const avg =

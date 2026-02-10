@@ -158,8 +158,9 @@ export function init(
         // Update the compensation label if present
         const compLabel = existing.querySelector('.comp-label');
         const globalVal = debugWindow.__FILTER_COMPENSATION_SENSITIVITY ?? 1.0;
-        if (compLabel)
+        if (compLabel) {
           compLabel.textContent = `comp: ${Number(globalVal).toFixed(2)}`;
+        }
       } catch {
         existing.textContent = `freq: ${info.freq.toFixed(1)}Hz\ngain: ${info.gain.toFixed(
           3
@@ -309,8 +310,9 @@ export function init(
             const compLabel = el.querySelector('.comp-label');
             const globalVal =
               debugWindow.__FILTER_COMPENSATION_SENSITIVITY ?? 1.0;
-            if (compLabel)
+            if (compLabel) {
               compLabel.textContent = `comp: ${Number(globalVal).toFixed(2)}`;
+            }
           } catch {
             // ignore label update failures
           }

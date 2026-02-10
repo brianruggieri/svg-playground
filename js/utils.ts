@@ -58,7 +58,7 @@ export function toSvgPoint(
   // matrixTransform can throw if svg has no CTM; assume well-formed SVG in DOM.
   // Using non-null assertion because consumer ensures svg is attached.
   // If needed, callers should wrap in try/catch.
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
   const transformed = pt.matrixTransform(svg.getScreenCTM()!.inverse());
   return { x: transformed.x, y: transformed.y };
 }
