@@ -34,6 +34,15 @@ import {
   stopAndClearLiveAudioNodes,
   getHoldDuration,
 } from './state';
+import {
+  initEngine,
+  type EngineHandle,
+  type NoteKind,
+  type VoiceProfile,
+  type DroneOptions,
+} from './engine/engine';
+import { humanizeSegmentTiming, humanizeVelocity } from './humanize';
+import { getGlowController } from './glow';
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
@@ -98,6 +107,52 @@ function getMasterOutput(audioCtx: AudioContext): AudioNode {
   // Route audio into the compressor so all sources share the same limiting stage.
   // Returning the compressor ensures callers connect into the compressor node.
   return nodes.compressor;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Worklet engine glue                                                        */
+/* -------------------------------------------------------------------------- */
+
+let engine: EngineHandle | null = null;
+let engineInitPromise: Promise<EngineHandle> | null = null;
+
+/**
+ * Load the Rust/WASM worklet engine and connect it into the master chain.
+ * Safe to call on a suspended context (module loading doesn't need a user
+ * gesture); idempotent across repeated calls.
+ */
+export function initAudioEngine(audioCtx: AudioContext): Promise<EngineHandle> {
+  if (engineInitPromise) return engineInitPromise;
+  ensureMasterNodes(audioCtx);
+  engineInitPromise = initEngine(audioCtx).then((handle) => {
+    handle.node.connect(getMasterOutput(audioCtx));
+    engine = handle;
+    return handle;
+  });
+  return engineInitPromise;
+}
+
+/** Drive the live drawing drone; no-op until the engine is ready. */
+export function setDrone(options: DroneOptions): void {
+  engine?.setDrone(options);
+}
+
+/**
+ * Flash the glow ring for a circle when its note becomes audible, aligning
+ * the DOM update with the audio clock. One dispatch per scheduled note —
+ * percussion included.
+ */
+function notifyGlow(
+  audioCtx: AudioContext,
+  circle: SVGCircleElement,
+  when: number,
+  detail: { freq: number; duration: number; intensity: number }
+): void {
+  const delayMs = Math.max(0, Math.round((when - audioCtx.currentTime) * 1000));
+  window.setTimeout(() => {
+    if (!circle.isConnected) return;
+    getGlowController()?.flash(circle, detail);
+  }, delayMs);
 }
 
 function minFilterFreq(audioCtx: AudioContext, floor = 40): number {
@@ -1104,103 +1159,108 @@ export function loopCircleAudio(
   // Clear any previous scheduled loop to avoid duplicates
   clearLoopTimeout(circle);
 
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+  // Per-circle timbre profile, computed once: the four axes the engine maps
+  // to FM index/morph/filter, unison/feedback, envelopes/glide, and
+  // pan-spread/delay-send.
+  const profile: VoiceProfile = {
+    // high on screen + short dashes = bright
+    spectral: clamp01(
+      0.6 * yFactor + 0.4 * (1 - Math.min(1, analysis.avgDashLength * 4))
+    ),
+    texture: clamp01(analysis.complexity / 12),
+    motion: clamp01(1 / (1 + analysis.dashGapRatio)),
+    space: clamp01(Math.abs(pan)),
+  };
+
   // Helper that schedules all dash segments for one rotation starting at startTime.
   const scheduleOneRotation = (startTime: number) => {
-    // Debug: report when we start scheduling a rotation
-    try {
-      console.debug('[loopCircleAudio] scheduleOneRotation start', {
-        circle,
-        startTime,
-        rotationPeriod,
-        segments: segmentsLoop.length,
-        totalLength,
-      });
-    } catch {
-      /* ignore debug failures */
-    }
-
     let t = startTime;
+    let dashIndex = 0;
     for (const seg of segmentsLoop) {
       const dur = (seg.length / totalLength) * rotationPeriod;
       if (seg.type === 'dash' && dur > 0) {
-        const rng = getRng(circle) ?? Math.random;
+        // ponytail: notes before engine-ready drop silently (t still advances,
+        // so there is no backlog burst once the worklet comes up).
+        if (engine) {
+          const rng = getRng(circle) ?? Math.random;
 
-        // Map segment length to a scale degree:
-        // - normalizedLen in (0..1), where larger values are longer dashes
-        // - longer dashes map toward lower indices (closer to tonic)
-        const normalizedLen = seg.length / totalLength;
-        const baseIndex = Math.round((1 - normalizedLen) * (scale.length - 1));
-        const jitterOffset = Math.floor((rng() - 0.5) * 2); // -1, 0, or +1
-        let noteIndex = Math.max(
-          0,
-          Math.min(scale.length - 1, baseIndex + jitterOffset)
-        );
-
-        // Extra bias: for relatively long dashes, prefer tonic (index 0)
-        if (normalizedLen > 0.25) noteIndex = 0;
-
-        let freq = scale[noteIndex] * (0.995 + rng() * 0.01);
-        // Clamp scheduled frequency to an audible range to avoid inaudible / subsonic notes
-        // (octave-shift if necessary). This prevents "dead" low-frequency notes at certain positions.
-        if (!isFinite(freq) || freq <= 0) freq = 440;
-        while (freq < 40) freq *= 2;
-        while (freq > 5000) freq /= 2;
-        try {
-          // Debug: log each scheduled note
-          try {
-            console.debug('[loopCircleAudio] scheduling note', {
-              freq: Number(freq.toFixed(2)),
-              start: Number(t.toFixed(3)),
-              dur: Number(dur.toFixed(3)),
-              pan: Number(pan.toFixed(3)),
-              circle,
-            });
-          } catch {
-            /* ignore debug failures */
-          }
-
-          playRichTone(
-            audioCtx,
-            freq,
-            pan,
-            dur,
-            yFactor,
-            t,
-            rng,
-            circle,
-            analysis
+          // Map segment length to a scale degree:
+          // - normalizedLen in (0..1), where larger values are longer dashes
+          // - longer dashes map toward lower indices (closer to tonic)
+          const normalizedLen = seg.length / totalLength;
+          const baseIndex = Math.round(
+            (1 - normalizedLen) * (scale.length - 1)
+          );
+          const jitterOffset = Math.floor((rng() - 0.5) * 2); // -1, 0, or +1
+          let noteIndex = Math.max(
+            0,
+            Math.min(scale.length - 1, baseIndex + jitterOffset)
           );
 
-          // NOTE: Event dispatch moved to `playRichTone` so UI receives synth-derived intensity.
-        } catch (err) {
-          // ignore scheduling errors but surface a debug message
-          try {
-            console.warn('[loopCircleAudio] scheduling error', {
-              err,
-              circle,
-              freq,
-              t,
-              dur,
-            });
-          } catch {
-            /* ignore debug failures */
+          // Extra bias: for relatively long dashes, prefer tonic (index 0)
+          if (normalizedLen > 0.25) noteIndex = 0;
+
+          let freq = scale[noteIndex] * (0.995 + rng() * 0.01);
+          if (!isFinite(freq) || freq <= 0) freq = 440;
+          while (freq < 40) freq *= 2;
+          while (freq > 5000) freq /= 2;
+
+          // Duration/position routing: very short dashes hiss, short dashes
+          // snap, long dashes anchor — kick on the left half of the canvas,
+          // bass tones on the right.
+          let kind: NoteKind;
+          if (dur < 0.08) {
+            kind = 'hat';
+          } else if (dur < 0.25) {
+            kind = 'snare';
+          } else if (pan < 0) {
+            kind = 'kick';
+          } else {
+            kind = 'tone';
+            while (freq > 220) freq /= 2; // bass register
           }
+
+          // Deterministic groove: seeded per-circle rng drives micro-timing
+          // and velocity so the loop swings the same way every rotation.
+          const beatPos = clamp01((t - startTime) / rotationPeriod);
+          const baseVel =
+            0.35 + 0.45 * yFactor + 0.2 * Math.min(1, normalizedLen * 3);
+          const velocity = Math.min(
+            1,
+            humanizeVelocity(baseVel, dashIndex, beatPos, {}, rng)
+          );
+          const timing = humanizeSegmentTiming(
+            t,
+            dur,
+            dashIndex,
+            beatPos,
+            {},
+            rng
+          );
+
+          engine.noteOn({
+            when: timing.startTimeSec,
+            freq,
+            durSec: timing.durationSec,
+            velocity,
+            pan,
+            kind,
+            profile,
+          });
+          notifyGlow(audioCtx, circle, timing.startTimeSec, {
+            freq,
+            duration: timing.durationSec,
+            intensity: velocity,
+          });
         }
+        dashIndex++;
       }
       t += dur;
     }
     // Persist scheduled horizon (one rotation from startTime)
     setScheduledUntil(circle, t);
-
-    // Debug: report completed scheduling horizon
-    try {
-      console.debug('[loopCircleAudio] scheduled rotation horizon', {
-        circle,
-        horizon: t,
-      });
-    } catch {
-      /* ignore debug failures */
-    }
   };
 
   // Scheduler with lookahead: schedule notes up to audioCtx.currentTime + LOOP_SCHEDULE_AHEAD_SEC.

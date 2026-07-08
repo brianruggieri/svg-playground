@@ -26,6 +26,7 @@ import {
   createAudioContext,
   createLiveAudio,
   fadeAndCleanupLiveAudio,
+  initAudioEngine,
   loopCircleAudio,
   playClickTone,
 } from './audio';
@@ -89,6 +90,9 @@ export function init(
   const clearBtnEl = clearBtn!;
 
   const audioCtx = options.audioCtx ?? createAudioContext();
+  // Fire-and-forget: worklet + WASM load fine on a suspended context; notes
+  // scheduled before the engine is ready drop silently.
+  void initAudioEngine(audioCtx).catch(console.error);
   const glow = initGlow(svgEl, {
     enableDebugPanel: false,
     persistConfig: false,
