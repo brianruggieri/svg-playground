@@ -9,7 +9,11 @@
  * Per-circle runtime handles live in the WeakMap-backed `state` module.
  */
 
-import { LOOP_SCHEDULE_AHEAD_SEC, SCHEDULER_INTERVAL_MS } from './constants';
+import {
+  LOOP_SCHEDULE_AHEAD_SEC,
+  SCHEDULER_INTERVAL_MS,
+  SCALES,
+} from './constants';
 import { analyzeSegments, chooseScale, SegmentLength } from './utils';
 import {
   getPos,
@@ -190,6 +194,86 @@ function notifyGlow(
   }, delayMs);
 }
 
+/**
+ * Position → stereo pan (clamped, with the pan-clamped marker attr), vertical
+ * brightness factor, and a semitone transpose. Shared by the loop scheduler
+ * and the live preview so both voice a circle from the same placement.
+ */
+function derivePlacement(circle: SVGCircleElement): {
+  pan: number;
+  yFactor: number;
+  semitoneFactor: number;
+} {
+  const pos = getPos(circle) ?? { x: 0, y: 0 };
+  // Defensive clamping so audio mapping remains audible at the edges.
+  const x = Math.max(0, Math.min(pos.x ?? 0, window.innerWidth));
+  const y = Math.max(0, Math.min(pos.y ?? 0, window.innerHeight));
+  // Pan from X, clamped to a reduced range to avoid hard-panned silent cases.
+  const PAN_LIMIT = 0.85;
+  const rawPan = (x / Math.max(1, window.innerWidth)) * 2 - 1;
+  const pan = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, rawPan));
+  // Mark the circle when pan was clamped so overlays can indicate the change.
+  try {
+    if (pan !== rawPan) circle.setAttribute('data-pan-clamped', '1');
+    else circle.removeAttribute('data-pan-clamped');
+  } catch {
+    /* ignore DOM write failures */
+  }
+  const yNorm = Math.max(0, Math.min(1, y / Math.max(1, window.innerHeight)));
+  const yFactor = 1 - yNorm;
+  // x maps to a semitone transpose roughly in [-4..+4]; no octave bias so
+  // pitches stay lower on average.
+  const transposeSemis = Math.round((x / window.innerWidth - 0.5) * 8);
+  const semitoneFactor = Math.pow(2, transposeSemis / 12);
+  return { pan, yFactor, semitoneFactor };
+}
+
+/**
+ * Audition the loop's voice while drawing: fire one FM `tone` note using the
+ * same placement (pan / transpose / brightness) the loop scheduler uses, so
+ * holding Space previews the instrument the finished loop will play — not a
+ * separate drone. One-shot like every loop note (no note-off); it rings and
+ * decays on its own. No-op until the engine is ready.
+ */
+export function previewLiveNote(
+  audioCtx: AudioContext,
+  circle: SVGCircleElement
+): void {
+  if (!engine) return;
+
+  const { pan, yFactor, semitoneFactor } = derivePlacement(circle);
+  // Pentatonic root (chooseScale's default for sparse patterns), transposed.
+  const scale = SCALES.pentatonic.map((f) => f * semitoneFactor);
+  // Higher on screen → higher scale degree.
+  const degree = Math.max(
+    0,
+    Math.min(scale.length - 1, Math.round(yFactor * (scale.length - 1)))
+  );
+  let freq = scale[degree];
+  if (!isFinite(freq) || freq <= 0) freq = 220;
+  while (freq > 5000) freq /= 2;
+  while (freq < 40) freq *= 2;
+
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const profile: VoiceProfile = {
+    spectral: clamp01(0.6 * yFactor + 0.2),
+    texture: 0.3,
+    motion: 0.5,
+    space: Math.abs(pan),
+  };
+
+  const when = audioCtx.currentTime + 0.005;
+  const velocity = Math.min(1, 0.4 + 0.5 * yFactor);
+  const durSec = 1.6; // rings like a long loop tone, then decays
+
+  engine.noteOn({ when, freq, durSec, velocity, pan, kind: 'tone', profile });
+  notifyGlow(audioCtx, circle, when, {
+    freq,
+    duration: durSec,
+    intensity: velocity,
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /* Loop scheduling                                                            */
 /* -------------------------------------------------------------------------- */
@@ -223,31 +307,7 @@ export function loopCircleAudio(
   const analysis = analyzeSegments(segmentsLoop, totalLength);
   const baseScale = chooseScale(analysis);
 
-  const pos = getPos(circle) ?? { x: 0, y: 0 };
-  // Defensive clamping for looped circles so audio mapping remains audible at edges.
-  const x = Math.max(0, Math.min(pos.x ?? 0, window.innerWidth));
-  const y = Math.max(0, Math.min(pos.y ?? 0, window.innerHeight));
-  // Compute pan from X position but clamp to a reduced range to avoid hard-panned silent cases.
-  const PAN_LIMIT = 0.85;
-  const rawPan = (x / Math.max(1, window.innerWidth)) * 2 - 1;
-  const pan = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, rawPan));
-  // Mark the circle when we've clamped the pan value so overlays can indicate the change.
-  try {
-    if (pan !== rawPan) circle.setAttribute('data-pan-clamped', '1');
-    else circle.removeAttribute('data-pan-clamped');
-  } catch {
-    /* ignore DOM write failures */
-  }
-  const yNorm = Math.max(0, Math.min(1, y / Math.max(1, window.innerHeight)));
-  const yFactor = 1 - yNorm;
-
-  // Use circle position to derive a musical transpose (reduced range) and ignore octave bias:
-  // - x maps to a semitone transpose roughly in [-4..+4] (reduced from [-6..+6])
-  // - y no longer shifts octave to avoid consistently high pitches
-  const transposeSemis = Math.round((x / window.innerWidth - 0.5) * 8);
-  // octave shift removed to keep pitches lower on average
-
-  const semitoneFactor = Math.pow(2, transposeSemis / 12);
+  const { pan, yFactor, semitoneFactor } = derivePlacement(circle);
 
   // Build a transposed scale to use for this circle (no octave multiplication)
   const scale = baseScale.map((f) => f * semitoneFactor);
