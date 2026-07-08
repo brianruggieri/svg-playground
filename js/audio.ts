@@ -129,12 +129,20 @@ let engineInitPromise: Promise<EngineHandle> | null = null;
 export function initAudioEngine(audioCtx: AudioContext): Promise<EngineHandle> {
   if (engineInitPromise) return engineInitPromise;
   ensureMasterNodes(audioCtx);
-  engineInitPromise = initEngine(audioCtx).then((handle) => {
+  const p: Promise<EngineHandle> = initEngine(audioCtx).then((handle) => {
+    // A dispose (or re-init) may have superseded this init while WASM/worklet
+    // load was in flight. If so, don't connect or install the stale handle —
+    // tear it down instead, or it leaks as an orphaned, never-disposed worklet.
+    if (engineInitPromise !== p) {
+      handle.dispose();
+      return handle;
+    }
     handle.node.connect(getMasterOutput(audioCtx));
     engine = handle;
     return handle;
   });
-  return engineInitPromise;
+  engineInitPromise = p;
+  return p;
 }
 
 /** Drive the live drawing drone; no-op until the engine is ready. */
@@ -148,13 +156,10 @@ export function setDrone(options: DroneOptions): void {
  * in flight, dispose once it resolves.
  */
 export function disposeAudioEngine(): void {
-  if (engine) {
-    engine.dispose();
-  } else if (engineInitPromise) {
-    // Init still in flight: dispose the handle once it resolves.
-    void engineInitPromise.then((handle) => handle.dispose()).catch(() => {});
-  }
+  if (engine) engine.dispose();
   engine = null;
+  // Supersede any in-flight init: nulling the promise makes its .then guard see
+  // a changed identity and dispose the orphaned handle itself.
   engineInitPromise = null;
 }
 

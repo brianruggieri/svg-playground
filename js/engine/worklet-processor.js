@@ -138,8 +138,11 @@ class SvgPlaygroundEngineProcessor extends AudioWorkletProcessor {
       this.outR = new Float32Array(ex.memory.buffer, ex.out_r_ptr(), 128);
     }
 
-    out[0].set(this.outL.subarray(0, frames));
-    if (out.length > 1) out[1].set(this.outR.subarray(0, frames));
+    // Views and the render quantum are both fixed at 128, so copy directly —
+    // subarray() would allocate a fresh view object every quantum on the audio
+    // thread (GC pressure). frames is asserted 128 by the AudioWorklet spec.
+    out[0].set(this.outL);
+    if (out.length > 1) out[1].set(this.outR);
     return true;
   }
 }

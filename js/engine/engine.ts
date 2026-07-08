@@ -78,18 +78,26 @@ async function compileWasm(): Promise<WebAssembly.Module> {
   return WebAssembly.compile(bytes);
 }
 
-const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+// NaN-safe: Math.min/max propagate NaN, and a single non-finite value reaching
+// a voice produces NaN samples that land in the shared ping-pong delay buffer,
+// where flush() never clears them — permanently silencing the engine. This ABI
+// boundary is the one choke point every note param passes through, so reject
+// non-finite here rather than trusting each caller.
+const clamp01 = (v: number) =>
+  Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
+const finite = (v: number, fallback: number) =>
+  Number.isFinite(v) ? v : fallback;
 
 /** Flatten a NoteOptions object into the number-only message the worklet reads. */
 function flattenNote(o: NoteOptions) {
   return {
     type: 'noteOn' as const,
-    when: o.when,
+    when: finite(o.when, 0),
     kind: KIND_CODE[o.kind],
-    freq: o.freq,
-    dur: o.durSec,
+    freq: finite(o.freq, 440),
+    dur: finite(o.durSec, 0.2),
     vel: clamp01(o.velocity),
-    pan: Math.max(-1, Math.min(1, o.pan)),
+    pan: Number.isFinite(o.pan) ? Math.max(-1, Math.min(1, o.pan)) : 0,
     s: clamp01(o.profile.spectral),
     t: clamp01(o.profile.texture),
     m: clamp01(o.profile.motion),
