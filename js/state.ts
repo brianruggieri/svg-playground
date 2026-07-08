@@ -3,10 +3,10 @@
  *
  * A small, typed WeakMap-based manager for per-circle runtime state.
  *
- * The original code attached ad-hoc properties to SVG elements (e.g. `circle._liveAudioNodes`,
- * `circle._loopTimeout`, `circle._activeOscillators`, etc.). That pattern is convenient but
- * undermines TypeScript safety. This module centralizes that runtime state in a typed WeakMap
- * and exposes helper functions to read/update/cleanup state for a given `SVGCircleElement`.
+ * The original code attached ad-hoc properties to SVG elements (e.g. `circle._loopTimeout`).
+ * That pattern is convenient but undermines TypeScript safety. This module centralizes that
+ * runtime state in a typed WeakMap and exposes helper functions to read/update/cleanup state
+ * for a given `SVGCircleElement`.
  *
  * Usage:
  *  - Call `ensureCircleState(circle, {...})` early (e.g. when creating the circle) to seed
@@ -15,16 +15,9 @@
  *  - Call `deleteState(circle)` to stop/clear timers/oscillators and remove the state entry.
  */
 
-import type { LiveAudioNodes } from './audio';
 import type { SegmentInput } from './utils';
 
 export type CirclePos = { x: number; y: number };
-
-export type ActiveOscillatorRecord = {
-  osc: OscillatorNode;
-  gain?: GainNode | null; // per-oscillator gain node (if present)
-  baseGain?: number; // computed base gain used for this voice (for recalculation)
-};
 
 export type CircleState = {
   // Core, present fields
@@ -32,10 +25,7 @@ export type CircleState = {
   rng: () => number;
 
   // Optional runtime handles
-  liveAudioNodes?: LiveAudioNodes | null;
   loopTimeout?: number | null;
-  // Store richer records for active oscillators so we can update per-voice gain in-flight.
-  activeOscillators?: ActiveOscillatorRecord[]; // oscillators + optional gain nodes created for scheduled notes
   segments?: SegmentInput[]; // recorded segments during hold
   holdDuration?: number; // milliseconds
   scheduledUntil?: number | null; // audioContext.currentTime up to which we've scheduled
@@ -62,10 +52,7 @@ export function ensureCircleState(
   const newState: CircleState = {
     pos: init?.pos ?? { x: 0, y: 0 },
     rng: init?.rng ?? defaultRng,
-    liveAudioNodes: init?.liveAudioNodes ?? null,
     loopTimeout: init?.loopTimeout ?? null,
-    // accept provided activeOscillators if present (compatible shape) or default to empty array
-    activeOscillators: init?.activeOscillators ?? [],
     segments: init?.segments ?? [],
     holdDuration: init?.holdDuration,
     scheduledUntil: init?.scheduledUntil ?? null,
@@ -135,121 +122,6 @@ export function getHoldDuration(circle: SVGCircleElement): number | undefined {
   return stateMap.get(circle)?.holdDuration;
 }
 
-/* ----------------------- Live Audio Nodes ----------------------- */
-
-export function setLiveAudioNodes(
-  circle: SVGCircleElement,
-  nodes: LiveAudioNodes | null
-): void {
-  const st = ensureCircleState(circle);
-  st.liveAudioNodes = nodes;
-}
-
-export function getLiveAudioNodes(
-  circle: SVGCircleElement
-): LiveAudioNodes | null | undefined {
-  return stateMap.get(circle)?.liveAudioNodes;
-}
-
-/**
- * Best-effort stop & disconnect of LiveAudioNodes.
- * This does not attempt advanced scheduling/fades — audio modules may provide
- * more graceful fade functions. This helper is defensive and swallows errors.
- */
-export function stopAndClearLiveAudioNodes(circle: SVGCircleElement): void {
-  const st = stateMap.get(circle);
-  const nodes = st?.liveAudioNodes;
-  if (!nodes) return;
-
-  try {
-    for (const osc of nodes.oscillators) {
-      try {
-        osc.stop();
-      } catch {
-        // ignore
-      }
-      try {
-        osc.disconnect();
-      } catch {
-        // ignore
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  try {
-    nodes.filter.disconnect();
-  } catch {
-    // ignore
-  }
-  try {
-    nodes.gain.disconnect();
-  } catch {
-    // ignore
-  }
-  try {
-    nodes.panner.disconnect();
-  } catch {
-    // ignore
-  }
-
-  if (st) st.liveAudioNodes = null;
-}
-
-/* ----------------------- Active oscillators ----------------------- */
-
-export function addActiveOscillator(
-  circle: SVGCircleElement,
-  osc: OscillatorNode,
-  gainNode?: GainNode | null,
-  baseGain?: number
-): void {
-  const st = ensureCircleState(circle);
-  st.activeOscillators = st.activeOscillators ?? [];
-  st.activeOscillators.push({ osc, gain: gainNode ?? null, baseGain });
-}
-
-export function getActiveOscillators(
-  circle: SVGCircleElement
-): ActiveOscillatorRecord[] {
-  return stateMap.get(circle)?.activeOscillators ?? [];
-}
-
-/** Stop and clear any active oscillators recorded for this circle. */
-export function stopAndClearActiveOscillators(circle: SVGCircleElement): void {
-  const st = stateMap.get(circle);
-  const arr = st?.activeOscillators;
-  if (!arr || arr.length === 0) return;
-
-  for (const rec of arr) {
-    try {
-      // stop oscillator (best-effort)
-      rec.osc.stop();
-    } catch {
-      // ignore
-    }
-    try {
-      // disconnect oscillator -> gain (if present) and gain -> rest
-      if (rec.gain) {
-        try {
-          rec.gain.disconnect();
-        } catch {
-          // ignore
-        }
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      rec.osc.disconnect();
-    } catch {
-      // ignore
-    }
-  }
-  if (st) st.activeOscillators = [];
-}
-
 /* ----------------------- Loop timeout helpers ----------------------- */
 
 export function setLoopTimeout(circle: SVGCircleElement, id: number): void {
@@ -301,17 +173,12 @@ export function getScheduledUntil(
 /* ----------------------- Full cleanup ----------------------- */
 
 /**
- * Stop/clear timers, oscillators, audio nodes and remove state entry.
- * This is a safe cleanup routine that attempts to leave no running resources.
+ * Stop the loop scheduler and remove the state entry. Notes already handed to
+ * the worklet engine ring out on their own (the lookahead is only ~0.1s).
+ * ponytail: add engine.allNotesOff if tails get long.
  */
 export function deleteState(circle: SVGCircleElement): void {
-  // clear timeout
   clearLoopTimeout(circle);
-  // stop live nodes
-  stopAndClearLiveAudioNodes(circle);
-  // stop active oscillators
-  stopAndClearActiveOscillators(circle);
-  // finally remove state entry
   stateMap.delete(circle);
 }
 
