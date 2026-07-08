@@ -17,7 +17,7 @@ import {
   createAudioContext,
   initAudioEngine,
   loopCircleAudio,
-  setDrone,
+  previewLiveNote,
   stopAllAudio,
   disposeAudioEngine,
 } from './audio';
@@ -93,7 +93,6 @@ export function init(
 
   // Instance local state
   let currentCircle: SVGCircleElement | null = null;
-  let currentPos: { x: number; y: number } | null = null;
   let holdStart: number | null = null;
   let lastSegmentStart: number | null = null;
   let isSpaceDown = false;
@@ -274,15 +273,13 @@ export function init(
     rafId = requestAnimationFrame(tick);
   }
 
-  // Reset hold state and stop the live drone.
+  // Reset hold state and cancel the live preview RAF.
   function resetHoldState() {
-    setDrone({ on: false });
     if (rafId) {
       cancelAnimationFrame(rafId);
       rafId = null;
     }
     currentCircle = null;
-    currentPos = null;
     segments = [];
     isSpaceDown = false;
     holdStart = null;
@@ -301,9 +298,6 @@ export function init(
 
     const total = now - holdStart;
     const dashArray = buildDashArray(segments, null, 0, total);
-
-    // Drone crossfades out under the first looped note.
-    setDrone({ on: false });
 
     // If the recorded segments contain no 'dash' entries (i.e. no beats),
     // animate the circle out with an emotional exit and cleanup instead of abrupt removal.
@@ -341,7 +335,6 @@ export function init(
   // Abort the current recording (used on pointercancel)
   function abortCurrentRecording() {
     if (!currentCircle) return;
-    setDrone({ on: false });
     try {
       currentCircle.remove();
     } catch {
@@ -361,7 +354,6 @@ export function init(
     const loc = toSvgPoint(svgEl, e);
     const created = createCircleAt(svgEl, loc);
     currentCircle = created as SVGCircleElement;
-    currentPos = loc;
 
     if (debugMode && currentCircle) {
       createOverlayForCircle(
@@ -402,16 +394,10 @@ export function init(
     lastSegmentStart = now;
     isSpaceDown = true;
 
-    // Start the live drawing drone. The circle's position is fixed at
-    // pointerdown, so a single param push per dash suffices — no RAF flood.
-    const px = currentPos?.x ?? 0;
-    const py = currentPos?.y ?? 0;
-    const yFactor = 1 - clamp01(py / Math.max(1, window.innerHeight));
-    setDrone({
-      on: true,
-      freq: 220 * Math.pow(4, yFactor),
-      brightness: clamp01(px / Math.max(1, window.innerWidth)),
-    });
+    // Audition the loop's voice: each dash-start fires the same FM note the
+    // loop will play at that dash's onset, so holding Space previews the
+    // finished instrument (not a separate drone).
+    if (currentCircle) previewLiveNote(audioCtx, currentCircle);
 
     e.preventDefault();
   }
@@ -427,15 +413,14 @@ export function init(
     lastSegmentStart = now;
     isSpaceDown = false;
 
-    // Dash ended: silence the drone until the next dash begins.
-    setDrone({ on: false });
+    // Dash ended. The preview note is one-shot and rings out on its own —
+    // nothing to silence here.
 
     e.preventDefault();
   }
 
   // Clear button handler
   function onClearClick() {
-    setDrone({ on: false });
     // Cut audio already scheduled into the worklet (up to one rotation ahead),
     // not just future scheduler ticks — otherwise long circles keep sounding.
     stopAllAudio();
@@ -470,7 +455,6 @@ export function init(
 
   // Return API: destroy handler + useful helpers
   function destroy() {
-    setDrone({ on: false });
     // Disconnect the worklet node and reset the engine singleton so a later
     // mount re-inits against its own context instead of the stale one.
     disposeAudioEngine();
