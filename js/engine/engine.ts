@@ -47,6 +47,8 @@ export interface EngineHandle {
   noteCap: number;
   noteOn(o: NoteOptions): void;
   setDrone(o: DroneOptions): void;
+  /** Silence sounding voices and drop notes already queued in the worklet. */
+  allNotesOff(): void;
   dispose(): void;
 }
 
@@ -168,6 +170,9 @@ export async function initEngine(
     noteCap,
     noteOn(o: NoteOptions): void {
       node.port.postMessage(flattenNote(o));
+    },
+    allNotesOff(): void {
+      node.port.postMessage({ type: 'allNotesOff' });
     },
     setDrone(o: DroneOptions): void {
       const now = ctx.currentTime;
