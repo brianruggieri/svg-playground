@@ -92,7 +92,48 @@ export function init(
   const glow = initGlow(svgEl, {
     enableDebugPanel: false,
     persistConfig: false,
+    audioContext: audioCtx,
+    syncToAudio: true,
   });
+
+  // Expose the glow controller on window for interactive debugging and provide
+  // lightweight logging wrappers so you can observe enqueue/start behavior.
+  try {
+    (window as unknown as Record<string, unknown>).__glowController = glow;
+
+    // Debug wrapper for enqueueScheduled: logs then forwards to the controller.
+    (window as unknown as Record<string, unknown>).__glowEnqueue = (
+      circleId: string,
+      audioTime: number
+    ) => {
+      try {
+        console.debug('[glow] enqueueScheduled', { circleId, audioTime });
+        glow.enqueueScheduled?.(circleId, audioTime);
+      } catch (err) {
+        console.error('[glow] enqueueScheduled error', err);
+      }
+    };
+
+    // Debug helper to kick the animator (best-effort). This will ensure the glow
+    // controller has the audio context set and will enqueue a tiny debug event
+    // to make the animator start so you can inspect logs / behavior.
+    (window as unknown as Record<string, unknown>).__glowStartAnimator = () => {
+      try {
+        console.debug('[glow] start animator (debug helper)');
+        glow.setAudioContext?.(audioCtx);
+        // enqueue a near-future debug item to start the animator loop
+        const now = audioCtx.currentTime;
+        glow.enqueueScheduled?.('__debug__', now + 0.001);
+      } catch (err) {
+        console.error('[glow] start animator error', err);
+      }
+    };
+
+    console.debug('[glow] initialized', { syncToAudio: true });
+  } catch (e) {
+    // Non-fatal: exposing for debug is optional
+    console.warn('Could not expose glow controller on window', e);
+  }
 
   // Debug window typing for filter compensation UI.
   // This gives us a typed handle instead of repeatedly casting `window as any`.
@@ -113,6 +154,9 @@ export function init(
   const trackedCircles = new Set<SVGCircleElement>();
   // Gate for immediate click tone feedback. Set to true to enable per-pointerdown click tone.
   const ENABLE_CLICK_TONE = false;
+  // Gate for live preview audio (createLiveAudio / fadeAndCleanupLiveAudio).
+  // Set to false to disable live playing audio while leaving loops active.
+  const ENABLE_LIVE_AUDIO = false;
 
   // Debug overlay state: map circles -> overlay elements
   let debugMode = false;
@@ -644,14 +688,16 @@ export function init(
     );
     const noteScale = chooseScale(analysis);
 
-    // create live audio nodes and attach to circle state
-    const liveNodes = createLiveAudio(
-      audioCtx,
-      currentCircle,
-      analysis,
-      noteScale
-    );
-    setLiveAudioNodes(currentCircle as SVGCircleElement, liveNodes);
+    // create live audio nodes and attach to circle state (gated by ENABLE_LIVE_AUDIO)
+    if (ENABLE_LIVE_AUDIO) {
+      const liveNodes = createLiveAudio(
+        audioCtx,
+        currentCircle,
+        analysis,
+        noteScale
+      );
+      setLiveAudioNodes(currentCircle as SVGCircleElement, liveNodes);
+    }
 
     e.preventDefault();
   }

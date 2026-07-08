@@ -33,6 +33,10 @@ export type NoteDetail = {
   freq?: number;
   duration?: number;
   intensity?: number;
+  // If present, this is the exact AudioContext time (seconds) when the sound will play.
+  // When the glow controller is initialized with audio sync enabled, the glow system
+  // will schedule visuals to align with this audio timeline.
+  scheduledAudioTime?: number;
 };
 
 export type GlowInitOptions = {
@@ -40,6 +44,11 @@ export type GlowInitOptions = {
   enableDebugPanel?: boolean;
   persistConfig?: boolean;
   storageKey?: string;
+  // Optional audio context to allow audio-synced glow scheduling.
+  audioContext?: AudioContext | null;
+  // When true and an AudioContext is provided, the controller will attempt to map
+  // scheduledAudioTime to a deterministic visual trigger using requestAnimationFrame.
+  syncToAudio?: boolean;
 };
 
 export type GlowController = {
@@ -48,13 +57,23 @@ export type GlowController = {
   applyConfig(next: Partial<GlowConfig>): void;
   flash(circle: SVGCircleElement, detail?: NoteDetail): void;
   setDebugPanelEnabled(on: boolean): void;
+  // Set or clear an AudioContext after initialization.
+  setAudioContext(ctx: AudioContext | null): void;
+  // Enqueue a scheduled visual directly (circleId must be present).
+  enqueueScheduled(
+    circleId: string,
+    scheduledAudioTime: number,
+    detail?: NoteDetail
+  ): void;
 };
 
 const DEFAULT_CONFIG: GlowConfig = {
   blur: 6,
-  opacityMultiplier: 1.0,
+  // Increased default opacity so glows are more visible by default.
+  opacityMultiplier: 1.6,
   scaleMultiplier: 1.0,
-  minOpacity: 0.06,
+  // Raise minimum visible opacity to ensure faint glows are still perceptible.
+  minOpacity: 0.12,
   maxOpacity: 1.0,
   minScale: 0.9,
   maxScale: 1.4,
@@ -83,6 +102,16 @@ type GlowState = {
   playingCount: number;
   storageKey: string;
   persistConfig: boolean;
+  // audio sync state
+  audioContext?: AudioContext | null;
+  syncToAudio?: boolean;
+  // Map from circleId -> queue of scheduled audio times (seconds)
+  queues?: Map<string, number[]>; // per-circle queue of scheduled audio times (seconds)
+  // Active deterministic animations (keyed by circleId)
+  animations?: Map<string, GlowAnimation>;
+  rafId?: number | null;
+  // audio clock base pair for mapping audio time -> performance.now
+  audioClockBase?: { audioTime: number; perfTime: number };
 };
 
 let __activeState: GlowState | null = null;
@@ -221,13 +250,24 @@ function createOrSyncGlowRing(
     ring.setAttribute('r', r ?? '0');
     ring.setAttribute('stroke', readStrokeColor(circle));
     ring.setAttribute('filter', 'url(#glow)');
-    ring.style.transition =
-      'opacity 140ms ease-out, transform 180ms cubic-bezier(.22,.9,.35,1)';
+    // Remove CSS transition usage for deterministic RAF-driven animation.
+    // The animator will drive opacity & transform directly; keep an explicit
+    // will-change hint so the browser can optimize compositing.
+    try {
+      ring.style.transition = '';
+    } catch {
+      /* ignore write failures */
+    }
     ring.style.opacity = '0';
     ring.style.transform = 'scale(1)';
     ring.style.pointerEvents = 'none';
     ring.style.transformBox = 'fill-box';
     ring.style.transformOrigin = 'center';
+    try {
+      ring.style.willChange = 'transform, opacity';
+    } catch {
+      /* ignore if unsupported */
+    }
   } catch {
     // best effort
   }
@@ -256,6 +296,249 @@ function applyFilterConfig(state: GlowState): void {
   }
 }
 
+/**
+ * Deterministic animation runner types & helpers
+ *
+ * We keep a small animation map on the state and run a single RAF loop that
+ * updates animations and also consumes queued audio-synced events. This makes
+ * fades deterministic (driven by performance.now mapped from the audio clock
+ * for scheduled events), cancellable, and immune to CSS transition races.
+ */
+type GlowAnimation = {
+  circleId: string;
+  ring: GlowRing;
+  circle: SVGCircleElement;
+  startPerf: number;
+  duration: number;
+  endPerf: number;
+  fromOpacity: number;
+  toOpacity: number;
+  fromScale: number;
+  toScale: number;
+  pulse: boolean;
+};
+
+function startGlobalAnimator(state: GlowState) {
+  if (!state) return;
+  if (state.rafId) return; // already running
+
+  // Debug: announce animator start
+  try {
+    console.debug && console.debug('[glow] animator start');
+  } catch {
+    /* ignore logging failures */
+  }
+
+  const tick = () => {
+    try {
+      state.rafId = null;
+      // compute now and (if available) refresh audio/perf base for mapping
+      const now = performance.now();
+      if (state.audioContext && state.audioClockBase) {
+        const baseAgeMs = now - state.audioClockBase.perfTime;
+        // refresh base occasionally (every ~1s)
+        if (baseAgeMs > 1000) {
+          state.audioClockBase = {
+            audioTime: state.audioContext.currentTime,
+            perfTime: performance.now(),
+          };
+        }
+      }
+
+      // 1) Consume ready queued audio times and create animations for them
+      if (state.queues && state.queues.size > 0) {
+        for (const [circleId, times] of Array.from(state.queues.entries())) {
+          while (times.length > 0) {
+            const tAudio = times[0];
+            let tPerf = performance.now();
+            if (state.audioClockBase && state.audioContext) {
+              tPerf =
+                state.audioClockBase.perfTime +
+                (tAudio - state.audioClockBase.audioTime) * 1000;
+            }
+            // epsilon to allow slight scheduling slack (ms)
+            if (now + 12 >= tPerf) {
+              // debug: queued event is due
+              try {
+                console.debug &&
+                  console.debug('[glow] dequeue', {
+                    circleId,
+                    tAudio,
+                    tPerf,
+                    now,
+                  });
+              } catch {
+                /* ignore logging failures */
+              }
+
+              // create a deterministic animation for this queued event
+              const target = state.svg.querySelector(
+                `circle[data-circle-id="${circleId}"]`
+              ) as SVGCircleElement | null;
+              if (target) {
+                try {
+                  // compute animation params
+                  const ring = createOrSyncGlowRing(state, target);
+                  if (ring) {
+                    const duration = Math.max(20, state.config.pulseDuration);
+                    const amp = computeAmplitude({ duration: duration / 1000 });
+                    const baseOpacity = clamp(
+                      amp * state.config.opacityMultiplier,
+                      state.config.minOpacity,
+                      state.config.maxOpacity
+                    );
+                    const baseScale = clamp(
+                      1 + amp * (0.25 * state.config.scaleMultiplier),
+                      state.config.minScale,
+                      state.config.maxScale
+                    );
+
+                    // register animation
+                    state.animations = state.animations ?? new Map();
+                    const anim: GlowAnimation = {
+                      circleId,
+                      ring,
+                      circle: target,
+                      startPerf: now,
+                      duration,
+                      endPerf: now + duration,
+                      fromOpacity: baseOpacity,
+                      toOpacity: 0,
+                      fromScale: baseScale,
+                      toScale: 1,
+                      pulse: !!state.config.pulseEnabled,
+                    };
+                    // Replacing an existing animation for this circleId reuses its
+                    // playingCount slot rather than adding a new one, since the old
+                    // animation is discarded here and will never reach its own
+                    // finalize/decrement step.
+                    const hadExisting = state.animations.has(circleId);
+                    state.animations.set(circleId, anim);
+
+                    // debug: animation started
+                    try {
+                      console.debug &&
+                        console.debug('[glow] anim started', {
+                          circleId,
+                          startPerf: anim.startPerf,
+                          duration: anim.duration,
+                        });
+                    } catch {
+                      /* ignore logging failures */
+                    }
+
+                    // reflect visual head state immediately
+                    try {
+                      ring.style.opacity = String(baseOpacity);
+                      ring.style.transform = `scale(${baseScale})`;
+                    } catch {
+                      /* ignore */
+                    }
+                    try {
+                      if (anim.pulse) ring.classList.add('playing');
+                      target.classList.add('emphasized');
+                    } catch {
+                      /* ignore */
+                    }
+                    if (!hadExisting) {
+                      state.playingCount = Math.max(0, state.playingCount) + 1;
+                    }
+                  }
+                } catch {
+                  // ignore per-item errors
+                }
+              }
+              times.shift();
+            } else {
+              // not ready yet
+              break;
+            }
+          }
+          if (times.length === 0) state.queues!.delete(circleId);
+        }
+      }
+
+      // 2) Advance & finalize active animations
+      if (state.animations && state.animations.size > 0) {
+        for (const [id, anim] of Array.from(state.animations.entries())) {
+          const progress = clamp(
+            (now - anim.startPerf) / Math.max(1, anim.duration),
+            0,
+            1
+          );
+          // ease-out cubic
+          const eased = 1 - Math.pow(1 - progress, 3);
+          const curOpacity =
+            anim.fromOpacity + (anim.toOpacity - anim.fromOpacity) * eased;
+          const curScale =
+            anim.fromScale + (anim.toScale - anim.fromScale) * eased;
+          try {
+            anim.ring.style.opacity = String(curOpacity);
+            anim.ring.style.transform = `scale(${curScale})`;
+          } catch {
+            /* ignore */
+          }
+
+          if (progress >= 1) {
+            // finalize
+            try {
+              anim.ring.style.opacity = String(anim.toOpacity);
+              anim.ring.style.transform = `scale(${anim.toScale})`;
+              anim.circle.classList.remove('emphasized');
+              if (anim.pulse) anim.ring.classList.remove('playing');
+            } catch {
+              /* ignore */
+            } finally {
+              state.animations!.delete(id);
+              state.playingCount = Math.max(0, state.playingCount - 1);
+
+              // debug: animation finalized
+              try {
+                console.debug &&
+                  console.debug('[glow] anim finalized', { id, now });
+              } catch {
+                /* ignore logging failures */
+              }
+            }
+          }
+        }
+      }
+
+      // 3) continue loop if needed
+      const needMore =
+        (state.queues && state.queues.size > 0) ||
+        (state.animations && state.animations.size > 0);
+      if (needMore) {
+        state.rafId = requestAnimationFrame(tick);
+      } else {
+        state.rafId = null;
+        // debug: animator idle
+        try {
+          console.debug && console.debug('[glow] animator idle');
+        } catch {
+          /* ignore logging failures */
+        }
+      }
+    } catch {
+      // on error, stop runner gracefully
+      try {
+        if (state.rafId) cancelAnimationFrame(state.rafId);
+      } catch {
+        /* ignore */
+      }
+      state.rafId = null;
+      // debug: animator error -> stopped
+      try {
+        console.debug && console.debug('[glow] animator stopped due to error');
+      } catch {
+        /* ignore logging failures */
+      }
+    }
+  };
+
+  state.rafId = requestAnimationFrame(tick);
+}
+
 function shouldThrottle(ring: GlowRing, throttleMs: number): boolean {
   if (throttleMs <= 0) return false;
   const last = ring.__lastFlashAt ?? 0;
@@ -270,15 +553,20 @@ function flashGlow(
   circle: SVGCircleElement,
   detail?: NoteDetail
 ): void {
+  // Deterministic, cancelable animation registration.
   const ring = createOrSyncGlowRing(state, circle);
   if (!ring) return;
 
   if (shouldThrottle(ring, state.config.throttleMs)) return;
-  const hasActiveTimer = typeof ring.__glowTimer === 'number';
+
+  const circleId = circle.getAttribute('data-circle-id') || '';
+
+  // Respect max concurrent; if an animation already exists for this circle ID we may replace it.
+  const hasExisting = !!(state.animations && state.animations.get(circleId));
   if (
     state.config.maxConcurrent > 0 &&
     state.playingCount >= state.config.maxConcurrent &&
-    !hasActiveTimer
+    !hasExisting
   ) {
     return;
   }
@@ -302,6 +590,7 @@ function flashGlow(
     state.config.maxScale
   );
 
+  // Prepare visual head state
   try {
     ring.style.opacity = String(baseOpacity);
     ring.style.transform = `scale(${baseScale})`;
@@ -316,37 +605,45 @@ function flashGlow(
   }
 
   if (state.config.pulseEnabled) {
-    ring.classList.add('playing');
-    circle.classList.add('emphasized');
+    try {
+      ring.classList.add('playing');
+      circle.classList.add('emphasized');
+    } catch {
+      // ignore
+    }
   }
 
-  if (typeof ring.__glowTimer === 'number') {
-    clearTimeout(ring.__glowTimer);
-    ring.__glowTimer = undefined;
-    state.playingCount = Math.max(0, state.playingCount - 1);
+  // Register deterministic animation
+  state.animations = state.animations ?? new Map();
+  const now = performance.now();
+  const anim: GlowAnimation = {
+    circleId,
+    ring,
+    circle,
+    startPerf: now,
+    duration,
+    endPerf: now + duration,
+    fromOpacity: baseOpacity,
+    toOpacity: 0,
+    fromScale: baseScale,
+    toScale: 1,
+    pulse: !!state.config.pulseEnabled,
+  };
+
+  // Replace any existing animation for this circle id. If one already existed,
+  // reuse its playingCount slot instead of adding a new one, since the replaced
+  // animation is discarded here and will never reach its own finalize/decrement step.
+  state.animations.set(circleId, anim);
+  if (!hasExisting) {
+    state.playingCount = Math.max(0, state.playingCount) + 1;
   }
 
-  state.playingCount += 1;
-
-  ring.__glowTimer = window.setTimeout(
-    () => {
-      try {
-        ring.style.opacity = '0';
-        ring.style.transform = 'scale(1)';
-        circle.classList.remove('emphasized');
-        if (state.config.pulseEnabled) {
-          ring.classList.remove('playing');
-          circle.classList.remove('emphasized');
-        }
-      } catch {
-        // ignore
-      } finally {
-        state.playingCount = Math.max(0, state.playingCount - 1);
-        ring.__glowTimer = undefined;
-      }
-    },
-    Math.max(80, duration)
-  );
+  // Ensure the RAF runner is active so we drive the animation
+  try {
+    startGlobalAnimator(state);
+  } catch {
+    // ignore
+  }
 }
 
 function loadPersistedConfig(storageKey: string): Partial<GlowConfig> | null {
@@ -545,6 +842,15 @@ function createDebugPanel(state: GlowState): HTMLDivElement {
 }
 
 function attachGlowEventListeners(state: GlowState): void {
+  // Ensure the shared deterministic animator is available when needed.
+  function ensureRafRunning(): void {
+    // start the shared deterministic animator which consumes both queued events
+    // and animates active fade animations. This delegates to the module-level
+    // startGlobalAnimator so flashes (immediate or queued) are driven by the
+    // same RAF loop.
+    startGlobalAnimator(state);
+  }
+
   const onNote = (ev: Event) => {
     try {
       const d = ev instanceof CustomEvent ? (ev.detail as NoteDetail) : null;
@@ -558,7 +864,25 @@ function attachGlowEventListeners(state: GlowState): void {
         target = d.circle;
       }
       if (target) {
-        flashGlow(state, target, d ?? undefined);
+        const scheduled =
+          typeof d?.scheduledAudioTime === 'number'
+            ? d!.scheduledAudioTime
+            : undefined;
+        if (
+          typeof scheduled === 'number' &&
+          state.syncToAudio &&
+          state.audioContext
+        ) {
+          // enqueue on per-circle queue
+          state.queues = state.queues ?? new Map();
+          const q = state.queues.get(circleId!) || [];
+          q.push(scheduled);
+          state.queues.set(circleId!, q);
+          ensureRafRunning();
+        } else {
+          // fallback: immediate visual
+          flashGlow(state, target, d ?? undefined);
+        }
       }
     } catch {
       // ignore
@@ -586,6 +910,16 @@ function attachGlowEventListeners(state: GlowState): void {
   state.listeners.push(() =>
     document.removeEventListener('svg-playground:flash', onFlash)
   );
+
+  // make sure RAF is cancelled on destroy
+  state.listeners.push(() => {
+    try {
+      if (state.rafId) cancelAnimationFrame(state.rafId);
+    } catch {
+      // ignore
+    }
+    state.rafId = null;
+  });
 }
 
 function attachMutationObservers(state: GlowState): void {
@@ -754,14 +1088,33 @@ function initGlowInternal(
     playingCount: 0,
     storageKey: options.storageKey ?? DEFAULT_STORAGE_KEY,
     persistConfig: options.persistConfig !== false,
+    // audio related defaults
+    audioContext: options.audioContext ?? null,
+    // If an AudioContext is supplied at init, default to enabling audio-sync so
+    // visuals will align with the audio timeline unless explicitly disabled.
+    syncToAudio: options.syncToAudio === true || !!options.audioContext,
+    queues: new Map(),
+    rafId: null,
+    audioClockBase: options.audioContext
+      ? {
+          audioTime: options.audioContext.currentTime,
+          perfTime: performance.now(),
+        }
+      : undefined,
   };
 
   __activeState = state;
 
   applyFilterConfig(state);
 
-  // initialize any existing spinners
-  for (const c of Array.from(svg.querySelectorAll('circle.spinner'))) {
+  // initialize any existing spinners/ghosts (create persistent glow rings up-front)
+  // We intentionally create glow rings for both the main spinner and its ghost outline
+  // so visuals are present and consistent even before any events/mutations occur.
+  for (const c of Array.from(
+    svg.querySelectorAll('circle.spinner, circle.ghost')
+  )) {
+    // Both spinner and ghost elements share the same data-circle-id; createOrSyncGlowRing
+    // will coalesce into a single glow ring per id but ensures the DOM element exists.
     createOrSyncGlowRing(state, c as SVGCircleElement);
   }
 
@@ -788,6 +1141,7 @@ function initGlowInternal(
       persistConfig(state);
     },
     flash: (circle: SVGCircleElement, detail?: NoteDetail) => {
+      // expose immediate flash API unchanged
       flashGlow(state, circle, detail);
     },
     setDebugPanelEnabled: (on: boolean) => {
@@ -800,6 +1154,43 @@ function initGlowInternal(
           // ignore
         }
         state.debugPanel = null;
+      }
+    },
+    // allow wiring or updating AudioContext after init so consumers can opt-in to audio-sync
+    setAudioContext: (ctx: AudioContext | null) => {
+      state.audioContext = ctx;
+      if (ctx) {
+        state.audioClockBase = {
+          audioTime: ctx.currentTime,
+          perfTime: performance.now(),
+        };
+      } else {
+        state.audioClockBase = undefined;
+      }
+    },
+    // enqueue a scheduled visual event (audio time in seconds)
+    enqueueScheduled: (
+      circleId: string,
+      scheduledAudioTime: number,
+      _detail?: NoteDetail
+    ) => {
+      if (!circleId) return;
+      state.queues = state.queues ?? new Map();
+      const q = state.queues.get(circleId) || [];
+      q.push(scheduledAudioTime);
+      q.sort((a, b) => a - b);
+      state.queues.set(circleId, q);
+      // Ensure audio clock base is populated and start the deterministic animator
+      try {
+        if (!state.audioClockBase && state.audioContext) {
+          state.audioClockBase = {
+            audioTime: state.audioContext.currentTime,
+            perfTime: performance.now(),
+          };
+        }
+        startGlobalAnimator(state);
+      } catch {
+        // ignore
       }
     },
   };
@@ -819,7 +1210,17 @@ export function initGlow(
 export function getGlowController(): GlowController | null {
   if (!__activeState) return null;
   return {
-    destroy: () => __activeState?.observers?.forEach((o) => o.disconnect()),
+    destroy: () => {
+      __activeState?.observers?.forEach((o) => o.disconnect());
+      // also run cleanup listeners to stop RAFs etc.
+      __activeState?.listeners?.forEach((off) => {
+        try {
+          off();
+        } catch {
+          // ignore
+        }
+      });
+    },
     getConfig: () =>
       __activeState ? { ...__activeState.config } : { ...DEFAULT_CONFIG },
     applyConfig: (next: Partial<GlowConfig>) => {
@@ -843,6 +1244,44 @@ export function getGlowController(): GlowController | null {
           // ignore
         }
         __activeState.debugPanel = null;
+      }
+    },
+    setAudioContext: (ctx: AudioContext | null) => {
+      if (!__activeState) return;
+      __activeState.audioContext = ctx;
+      __activeState.syncToAudio = !!ctx && !!__activeState.syncToAudio;
+      if (ctx) {
+        __activeState.audioClockBase = {
+          audioTime: ctx.currentTime,
+          perfTime: performance.now(),
+        };
+      } else {
+        __activeState.audioClockBase = undefined;
+      }
+    },
+    enqueueScheduled: (
+      circleId: string,
+      scheduledAudioTime: number,
+      _detail?: NoteDetail
+    ) => {
+      if (!__activeState) return;
+      if (!circleId) return;
+      __activeState.queues = __activeState.queues ?? new Map();
+      const q = __activeState.queues.get(circleId) || [];
+      q.push(scheduledAudioTime);
+      q.sort((a, b) => a - b);
+      __activeState.queues.set(circleId, q);
+      // Ensure audio clock base is populated and start the deterministic animator
+      try {
+        if (!__activeState.audioClockBase && __activeState.audioContext) {
+          __activeState.audioClockBase = {
+            audioTime: __activeState.audioContext.currentTime,
+            perfTime: performance.now(),
+          };
+        }
+        startGlobalAnimator(__activeState);
+      } catch {
+        // ignore
       }
     },
   };

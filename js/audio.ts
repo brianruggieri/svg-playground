@@ -34,10 +34,127 @@ import {
   stopAndClearLiveAudioNodes,
   getHoldDuration,
 } from './state';
+import { getGlowController } from './glow';
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
 /* -------------------------------------------------------------------------- */
+
+export type VoiceProfile = {
+  spectral: number; // 0..1 bright <-> dark
+  texture: number; // 0..1 detune/cluster
+  motion: number; // 0..1 attack/release/glide
+  space: number; // 0..1 stereo/reverb
+  presetName?: string;
+};
+
+/**
+ * Map a normalized 4-axis voice profile into concrete synth-safe parameters.
+ * The mapping is intentionally conservative for mobile (caps partials / detune).
+ */
+export function mapProfileToParams(
+  p: VoiceProfile,
+  audioCtx: AudioContext,
+  isMobile?: boolean
+): {
+  partialCount: number;
+  brightFlag: boolean;
+  detuneVoices: number;
+  detuneSpreadCents: number;
+  attack: number;
+  release: number;
+  glideMs: number;
+  panSpread: number;
+  reverbSend: number;
+  filterFreq: number;
+} {
+  const S = Math.max(0, Math.min(1, p.spectral));
+  const T = Math.max(0, Math.min(1, p.texture));
+  const M = Math.max(0, Math.min(1, p.motion));
+  const P = Math.max(0, Math.min(1, p.space));
+
+  const uaMobile = /Mobi|Android|iPhone|iPad/.test(navigator.userAgent || '');
+  const mobile = typeof isMobile === 'boolean' ? isMobile : uaMobile;
+
+  const partialCap = mobile ? 8 : 16;
+  const partialCount = Math.min(partialCap, 1 + Math.round(6 * S));
+  const brightFlag = S > 0.6;
+
+  const detuneVoices = mobile
+    ? Math.max(1, Math.round(1 + Math.floor(2 * T)))
+    : Math.max(1, Math.round(1 + Math.floor(3 * T)));
+  const detuneSpreadCents = T * (mobile ? 12 : 24);
+
+  const attack = 0.006 + 0.174 * M; // 0.006..0.18
+  const release = 0.04 + 1.16 * M; // 0.04..1.2
+  const glideMs = Math.round(140 * M);
+
+  const panSpread = 0.6 * P;
+  const reverbSend = 0.22 * P;
+
+  const sr = audioCtx.sampleRate || 44100;
+  const minFilter = Math.max(40, sr * 0.001);
+  const filterFreq = Math.max(
+    minFilter,
+    Math.round(500 + (12000 - 500) * S * (1 - 0.1 * (1 - P)))
+  );
+
+  return {
+    partialCount,
+    brightFlag,
+    detuneVoices,
+    detuneSpreadCents,
+    attack,
+    release,
+    glideMs,
+    panSpread,
+    reverbSend,
+    filterFreq,
+  };
+}
+
+/**
+ * Return a PeriodicWave cached on the audio context if available; otherwise build one.
+ * Key is based on harmonic count and a shape flag. This helper is used by the voice profile
+ * pipeline to prefer PeriodicWave synthesis where available for efficient rich timbres.
+ */
+function getOrCreatePeriodicWave(
+  audioCtx: AudioContext,
+  harmonics: number,
+  bright: boolean
+): PeriodicWave | undefined {
+  try {
+    const ctxAny = audioCtx as unknown as {
+      __pwCache?: Map<string, PeriodicWave>;
+    };
+    let cache = ctxAny.__pwCache;
+    if (!cache) {
+      cache = new Map();
+      ctxAny.__pwCache = cache;
+    }
+    const key = `h${Math.max(1, harmonics)}_${bright ? 'b' : 's'}`;
+    const existing = cache.get(key);
+    if (existing) return existing;
+
+    const partialCount = Math.max(1, Math.min(32, harmonics)); // cap partials
+    const real = new Float32Array(partialCount + 1);
+    const imag = new Float32Array(partialCount + 1);
+    for (let i = 1; i <= partialCount; i++) {
+      // amplitude falloff; slightly brighter when requested
+      const baseAmp = 1 / i;
+      const softness = bright ? 1.0 : 0.82;
+      real[i] = baseAmp * softness;
+      imag[i] = 0;
+    }
+    const pw = audioCtx.createPeriodicWave(real, imag, {
+      disableNormalization: false,
+    });
+    cache.set(key, pw);
+    return pw;
+  } catch {
+    return undefined;
+  }
+}
 
 const masterNodesMap = new WeakMap<
   AudioContext,
@@ -527,6 +644,9 @@ export function createAudioContext(): AudioContext {
  *
  * Note: `circle` is a plain `SVGCircleElement`. Per-circle runtime data
  * (position, rng, etc.) is read from the `state` module (WeakMap).
+ *
+ * New: accepts an optional `voiceProfile` that will be mapped via `mapProfileToParams`
+ * to influence partial count, detune spread and envelope defaults.
  */
 export function playRichTone(
   audioCtx: AudioContext,
@@ -537,14 +657,12 @@ export function playRichTone(
   startTime: number,
   rng: () => number,
   circle: SVGCircleElement,
-  analysis: ReturnType<typeof analyzeSegments>
+  analysis: ReturnType<typeof analyzeSegments>,
+  voiceProfile?: VoiceProfile
 ): void {
   // Sanitize pan / yFactor and base frequency to avoid inaudible / out-of-range values.
-  // Reduce extreme panning slightly so voices aren't pushed to fully-left/right which can
-  // be effectively inaudible on some devices or with certain routing.
   const PAN_LIMIT = 0.85;
   const panClamped = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, pan));
-  // If we had to clamp the incoming pan, mark the element so debug overlays can pick this up.
   try {
     if (panClamped !== pan) circle.setAttribute('data-pan-clamped', '1');
     else circle.removeAttribute('data-pan-clamped');
@@ -554,54 +672,62 @@ export function playRichTone(
   const yFactorClamped = Math.max(0, Math.min(1, yFactor));
   const baseFreq = Math.max(40, Math.min(20000, freq));
 
-  const gain = audioCtx.createGain();
-
   // Compute harmonic count early so we can normalize per-voice amplitude.
-  const harmonics = 1 + Math.floor(analysis.complexity / 3);
-  // Ensure the raw base gain is in a reasonable audible range.
+  const baseHarmonics = 1 + Math.floor(analysis.complexity / 3);
   const baseGainRaw = Math.max(0.02, 0.1 + yFactorClamped * 0.3);
-  // Normalize per-voice level so adding more harmonic voices doesn't linearly increase level.
   let normalizedBaseGain =
-    (baseGainRaw / Math.sqrt(Math.max(1, harmonics))) *
+    (baseGainRaw / Math.sqrt(Math.max(1, baseHarmonics))) *
     PER_VOICE_GAIN_MULTIPLIER;
 
-  // Compute the raw filter frequency we intend to use and check whether it will be clamped.
-  // If the filter would be clamped to the floor, the resulting spectral energy can be
-  // much lower; compensate by increasing per-voice gain proportionally to the estimated
-  // spectral deficit. The compensation is dynamic (not a fixed multiplier) so it adapts
-  // to how far below the floor the computed filter would be.
+  // If a voiceProfile is provided, map it to concrete params and prefer its periodic wave
+  const mapped = voiceProfile
+    ? mapProfileToParams(voiceProfile, audioCtx)
+    : null;
+  const pw =
+    (mapped &&
+      getOrCreatePeriodicWave(
+        audioCtx,
+        mapped.partialCount,
+        mapped.brightFlag
+      )) ??
+    getOrCreatePeriodicWave(
+      audioCtx,
+      baseHarmonics,
+      analysis.avgDashLength <= 0.2
+    );
+
+  // Compute detune offsets (spread around 0) based on mapped params or analysis-derived harmonics.
+  const detuneCount = mapped?.detuneVoices ?? Math.max(1, baseHarmonics);
+  const detuneSpread = mapped?.detuneSpreadCents ?? 8;
+  const detuneOffsets = Array.from(
+    { length: Math.max(1, detuneCount) },
+    (_, i) => {
+      const n = Math.max(1, detuneCount - 1);
+      const pos = n === 0 ? 0 : (i - n / 2) / n; // -0.5..0.5
+      const jitter = (rng() - 0.5) * (detuneSpread * 0.25);
+      return pos * detuneSpread + jitter;
+    }
+  );
+
+  // Compute filter / envelope defaults; mapProfile may override attack/release
   const rawFilterFreq = 500 + panClamped * 2000 + yFactorClamped * 3000;
   const minF = minFilterFreq(audioCtx);
-
   const willFilterBeClamped = rawFilterFreq < minF;
   if (willFilterBeClamped) {
-    // Estimate the fractional deficit (how much of the intended bandwidth is lost).
     const deficit = (minF - rawFilterFreq) / Math.max(minF, 1);
-
-    // Map deficit to a compensation factor in a safe range [1.0 .. 2.2].
-    // This scaling is intentionally conservative: it restores perceived loudness
-    // without creating large peaks that the master compressor/waveshaper must fight.
     const COMP_MIN = 1.0;
     const COMP_MAX = 2.2;
-
-    // Read a runtime sensitivity value from window to allow interactive tuning.
-    // We type the window accessor locally to avoid `any` usage elsewhere.
     type WindowWithComp = Window & {
       __FILTER_COMPENSATION_SENSITIVITY?: number;
     };
     const w = window as unknown as WindowWithComp;
-    // Sensitivity default = 1.0, clamp to a safe range [0.0 .. 5.0].
     const sensitivity = Math.max(
       0,
       Math.min(5, Number(w.__FILTER_COMPENSATION_SENSITIVITY ?? 1.0))
     );
-
-    // Scale the deficit to produce a smooth factor; the base multiplier of 1.8
-    // controls sensitivity, and we further modulate it by the runtime sensitivity.
     const scaled = Math.min(COMP_MAX - COMP_MIN, deficit * 1.8 * sensitivity);
     const compensationFactor = COMP_MIN + scaled;
     normalizedBaseGain *= compensationFactor;
-
     try {
       circle.setAttribute('data-filter-clamped', '1');
     } catch {
@@ -615,50 +741,46 @@ export function playRichTone(
     }
   }
 
-  // Master gain will act as an envelope (0..1). Per-oscillator gains hold the
-  // normalized amplitude so adding harmonics doesn't increase loudness.
-  // Set the master gain to a neutral multiplicative value; the realtime envelope
-  // below will drive it from near-0 -> 1 -> near-0.
-  gain.gain.value = 1.0;
+  // Shared nodes for this note
+  const masterGain = audioCtx.createGain();
+  masterGain.gain.value = 1.0;
 
-  const detunes = Array.from(
-    { length: harmonics },
-    (_, i) => i * 5 * (rng() > 0.5 ? 1 : -1)
-  );
-
-  // Clamp scheduled duration to a minimum so notes aren't shorter than the envelope.
   const useDuration = Math.max(duration, MIN_NOTE_DURATION_SEC);
-
-  // Adapt attack to the note length: use analysis-informed attack but never exceed
-  // a fraction of the note and never go below a minimum sensible attack.
-  const attackTime = Math.min(
+  let attackTime = Math.min(
     Math.max(MIN_ATTACK_SEC, (analysis.avgDashLength || 0) * 0.1),
     useDuration * 0.45
   );
+  let releaseTime = Math.min(useDuration * 0.5, NOTE_RELEASE_SEC);
 
-  // Use release computed from the clamped duration to ensure ramps finish before stop.
-  const releaseTime = Math.min(useDuration * 0.5, NOTE_RELEASE_SEC);
+  if (mapped) {
+    try {
+      attackTime = Math.max(
+        MIN_ATTACK_SEC,
+        Math.min(useDuration * 0.45, mapped.attack)
+      );
+      releaseTime = Math.max(
+        0.001,
+        Math.min(useDuration * 0.5, mapped.release)
+      );
+    } catch {
+      /* ignore mapping errors */
+    }
+  }
 
-  // Note end/time bookkeeping uses the clamped duration so ramps and stops align.
   const noteEnd = startTime + useDuration;
 
-  // Master envelope: drive master gain 0 -> 1 -> 0 so the per-oscillator gains
-  // determine absolute amplitude and the master node simply shapes the note.
-  // Use a tiny non-zero floor to avoid audio artifacts in some engines.
-  gain.gain.setValueAtTime(0.0001, startTime);
+  // Master envelope on the per-note gain
+  masterGain.gain.setValueAtTime(0.0001, startTime);
   try {
-    gain.gain.linearRampToValueAtTime(1.0, startTime + attackTime);
-    gain.gain.setValueAtTime(1.0, noteEnd - releaseTime);
-    gain.gain.linearRampToValueAtTime(0.0001, noteEnd);
+    masterGain.gain.linearRampToValueAtTime(1.0, startTime + attackTime);
+    masterGain.gain.setValueAtTime(1.0, noteEnd - releaseTime);
+    masterGain.gain.linearRampToValueAtTime(0.0001, noteEnd);
   } catch {
-    // Fallback for environments that reject precise scheduling: ensure we at least
-    // have the master at a sensible level and queue a timeout to silence it later.
-    gain.gain.value = 1.0;
-    // Schedule a safety timeout to set the master gain back to 0 after noteEnd.
+    masterGain.gain.value = 1.0;
     window.setTimeout(
       () => {
         try {
-          gain.gain.value = 0;
+          masterGain.gain.value = 0;
         } catch {
           /* ignore */
         }
@@ -669,114 +791,201 @@ export function playRichTone(
 
   const filter = audioCtx.createBiquadFilter();
   filter.type = 'lowpass';
-  // Use clamped pan/yFactor values so filter frequency is always in a reasonable audible range.
-  filter.frequency.value = Math.max(
-    minFilterFreq(audioCtx),
-    500 + panClamped * 2000 + yFactorClamped * 3000
-  );
+  filter.frequency.value = Math.max(minFilterFreq(audioCtx), rawFilterFreq);
   filter.Q.value = 1 + (analysis.dashGapRatio || 0) * 5;
 
   const panner = new StereoPannerNode(audioCtx, { pan: panClamped });
 
-  // Primary voice path
-  filter.connect(gain);
-  gain.connect(panner);
+  // route: detuned oscillators -> filter -> masterGain -> panner -> master output
+  filter.connect(masterGain);
+  masterGain.connect(panner);
+  panner.connect(getMasterOutput(audioCtx));
 
-  // Per-note tail: short feedback delay + lowpass to provide a decaying tail that persists
-  // briefly after oscillators are stopped. This helps mask tail-end clipping.
+  // Per-note tail network (keeps previous tail behavior)
   const tailLP = audioCtx.createBiquadFilter();
   tailLP.type = 'lowpass';
   tailLP.frequency.value = 1200;
 
   const tailDelay = audioCtx.createDelay();
-  // short delay to create a small echo-like tail
   try {
-    // reduced delay time for a tighter, less pronounced tail
     tailDelay.delayTime.value = 0.035;
   } catch {
-    // some browsers may restrict immediate parameter setting; ignore
+    /* ignore */
   }
 
   const tailFeedback = audioCtx.createGain();
-  // lower feedback to ensure a smoother, faster-decaying tail and avoid build-up
-  tailFeedback.gain.value = 0.28; // feedback < 1 to decay
+  tailFeedback.gain.value = 0.28;
 
   const tailGain = audioCtx.createGain();
-  // tailGain will be ramped down at note end to create a smooth tail fade
 
-  // feedback loop: tailLP -> tailDelay -> tailFeedback -> tailLP
   tailLP.connect(tailDelay);
   tailDelay.connect(tailFeedback);
   tailFeedback.connect(tailLP);
-
-  // send tail to panner (mixed with main voice)
   tailDelay.connect(tailGain);
   tailGain.connect(panner);
 
-  // route through per-AudioContext master output to allow global compression/mastering
-  panner.connect(getMasterOutput(audioCtx));
+  // Visual dispatch moved to per-voice scheduler (schedulePooledNote primary voice).
+  // The visual enqueue is handled when the primary voice is scheduled so glows only
+  // appear when audio is actually scheduled/played.
 
-  // Schedule a detailed note event to fire at the audible `startTime` so visuals
-  // align with when the note actually becomes audible. Using a scheduled
-  // timeout keeps the visual event in sync with the audio timeline.
-  try {
-    const cid =
-      circle && circle.getAttribute
-        ? circle.getAttribute('data-circle-id')
-        : null;
-    // Use normalizedBaseGain as a proxy for amplitude; scale into [0..1] range for UI.
-    const intensity = Math.min(1, Math.max(0, normalizedBaseGain * 1.6));
-    const detail = {
-      circleId: cid,
-      freq: Number(baseFreq.toFixed(2)),
+  // Create and schedule individual detuned voices via helper so we can optionally use
+  // PeriodicWave or other mapped parameters per voice while keeping the shared filter/master path.
+  detuneOffsets.forEach((off, idx) => {
+    const f = Math.max(40, baseFreq * (1 + off / 1200));
+    schedulePooledNote({
+      audioCtx,
+      freq: f,
+      pan: panClamped,
       duration: useDuration,
-      intensity,
-    };
-    // Compute delay from audio context time to align the DOM event with `startTime`
-    const delayMs = Math.max(
-      0,
-      Math.round((startTime - (audioCtx?.currentTime ?? 0)) * 1000)
+      startTime,
+      circle,
+      analysis,
+      periodicWave: pw,
+      masterFilter: filter,
+      baseGain: normalizedBaseGain,
+      // mark primary voice (first detune) so only it enqueues the glow
+      isPrimary: idx === 0,
+    });
+  });
+
+  // Tail envelope scheduling (same behavior as before)
+  const tailDuration = Math.max(NOTE_RELEASE_SEC, NOTE_STOP_SLACK_SEC);
+  try {
+    const tailInitial = Math.max(0.01, 0.04 + yFactorClamped * 0.12);
+    const nowSched = audioCtx.currentTime;
+    tailGain.gain.setValueAtTime(0, nowSched);
+    tailGain.gain.linearRampToValueAtTime(
+      tailInitial,
+      noteEnd - Math.min(0.01, tailDuration / 4)
     );
-    const dispatchFn = () => {
-      try {
-        const ev = new CustomEvent('svg-playground:note', { detail });
-        document.dispatchEvent(ev);
-      } catch {
-        /* ignore dispatch errors */
-      }
-    };
-    // If the event should fire immediately or nearly immediately, dispatch on next tick
-    if (delayMs <= 20) {
-      window.setTimeout(dispatchFn, 0);
-    } else {
-      window.setTimeout(dispatchFn, delayMs);
-    }
+    tailGain.gain.setValueAtTime(tailInitial, noteEnd);
+    tailGain.gain.linearRampToValueAtTime(0, noteEnd + tailDuration);
   } catch {
-    /* ignore scheduling/dispatch errors */
+    tailGain.gain.value = Math.max(0.01, 0.04 + yFactorClamped * 0.1);
   }
 
-  // Create and schedule oscillators. Track them in the state map via helper.
-  detunes.forEach((detune) => {
+  // Cleanup tail network after it's done
+  const cleanupMs = Math.round(
+    (tailDuration + NOTE_STOP_SLACK_SEC + 0.05) * 1000
+  );
+  window.setTimeout(() => {
+    try {
+      tailDelay.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      tailFeedback.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      tailLP.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      tailGain.disconnect();
+    } catch {
+      /* ignore */
+    }
+  }, cleanupMs);
+}
+
+/**
+ * Schedule a single detuned voice into the provided shared filter/master path.
+ * This mirrors the previous per-oscillator scheduling behavior but centralizes
+ * per-voice setup so higher-level callers (like playRichTone) can reuse nodes.
+ */
+function schedulePooledNote(params: {
+  audioCtx: AudioContext;
+  freq: number;
+  pan: number;
+  duration: number;
+  startTime: number;
+  circle: SVGCircleElement;
+  analysis: ReturnType<typeof analyzeSegments>;
+  periodicWave?: PeriodicWave | undefined;
+  masterFilter: BiquadFilterNode;
+  baseGain: number;
+  isPrimary?: boolean;
+}): void {
+  try {
+    const {
+      audioCtx,
+      freq,
+      startTime,
+      duration,
+      circle,
+      periodicWave,
+      masterFilter,
+      baseGain,
+      isPrimary,
+    } = params;
+
+    // If this is the primary voice for the note, enqueue one glow visual now
+    // that audio is actually scheduled. Percussion uses the same single-enqueue
+    // path in notifyGlowScheduled.
+    try {
+      if (isPrimary && circle && circle.getAttribute) {
+        const cid = circle.getAttribute('data-circle-id');
+        const glow = getGlowController();
+        if (glow && cid) {
+          glow.setAudioContext?.(audioCtx);
+          glow.enqueueScheduled?.(cid, startTime);
+        }
+      }
+    } catch {
+      // ignore any glow enqueue errors to keep audio scheduling robust
+    }
+
+    const useDuration = Math.max(duration, MIN_NOTE_DURATION_SEC);
+    const noteEnd = startTime + useDuration;
+
     const osc = audioCtx.createOscillator();
-    osc.type = analysis.avgDashLength > 0.2 ? 'sine' : 'triangle';
-    // Use sanitized baseFreq and detune to set oscillator frequency.
-    osc.frequency.value = baseFreq * (1 + detune / 1200);
+    // choose a basic waveform; PeriodicWave will override if provided
+    osc.type = 'sine';
 
-    // Per-oscillator gain so harmonics sum remains controlled. Use the normalized
-    // per-voice level computed earlier (normalizedBaseGain).
+    // If a PeriodicWave is provided, prefer it for richer timbres without many oscillators
+    try {
+      if (periodicWave) {
+        try {
+          osc.setPeriodicWave(periodicWave);
+        } catch {
+          // ignore (some engines restrict while running)
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      osc.frequency.setValueAtTime(
+        Math.max(20, freq),
+        Math.max(audioCtx.currentTime, startTime - 0.02)
+      );
+    } catch {
+      try {
+        osc.frequency.value = Math.max(20, freq);
+      } catch {
+        // ignore
+      }
+    }
+
     const oscGain = audioCtx.createGain();
-    // defensive floor to avoid silent voices
-    oscGain.gain.value = Math.max(0.0001, normalizedBaseGain);
+    oscGain.gain.value = Math.max(0.0001, baseGain);
 
-    // Connect oscillator through its gain into the shared filter so the filter sees
-    // the summed harmonic content while each voice keeps its own amplitude control.
-    osc.connect(oscGain);
-    oscGain.connect(filter);
+    // Connect into the shared filter so per-voice content is processed by the same filter & tail.
+    try {
+      osc.connect(oscGain);
+      oscGain.connect(masterFilter);
+    } catch {
+      // best-effort connections
+    }
 
     // Start/stop scheduling aligned to note envelope
     try {
       osc.start(startTime);
-      // Stop slightly after the release completes to ensure the ramp has time to finish.
       osc.stop(noteEnd + NOTE_STOP_SLACK_SEC + 0.02);
     } catch {
       try {
@@ -788,59 +997,14 @@ export function playRichTone(
     }
 
     // Track oscillator + gain for later cleanup and real-time gain control
-    addActiveOscillator(circle, osc, oscGain, normalizedBaseGain);
-  });
-
-  // Schedule tail envelope: keep tail active during note, then fade it out smoothly.
-  // Compute tail duration (how long to let feedback decay)
-  const tailDuration = Math.max(NOTE_RELEASE_SEC, NOTE_STOP_SLACK_SEC);
-
-  try {
-    // initial tail level ~50% of voice base (scaled by yFactor for consistency)
-    // slightly lower initial tail level and gentler scaling with y position
-    const tailInitial = Math.max(0.01, 0.04 + yFactor * 0.12);
-    // ensure tailGain is set for current context
-    const nowSched = audioCtx.currentTime;
-    tailGain.gain.setValueAtTime(0, nowSched);
-    // start tail slightly before note end so feedback network has energy
-    tailGain.gain.linearRampToValueAtTime(
-      tailInitial,
-      noteEnd - Math.min(0.01, tailDuration / 4)
-    );
-    // at note end, begin a smooth linear ramp to 0 over tailDuration
-    tailGain.gain.setValueAtTime(tailInitial, noteEnd);
-    tailGain.gain.linearRampToValueAtTime(0, noteEnd + tailDuration);
+    try {
+      addActiveOscillator(circle, osc, oscGain, baseGain);
+    } catch {
+      // ignore
+    }
   } catch {
-    // if scheduling fails, set a conservative static gain
-    tailGain.gain.value = Math.max(0.01, 0.04 + yFactor * 0.1);
+    // swallow errors to avoid affecting scheduling loop
   }
-
-  // Cleanup: disconnect tail nodes after the tail has finished to free resources.
-  const cleanupMs = Math.round(
-    (tailDuration + NOTE_STOP_SLACK_SEC + 0.05) * 1000
-  );
-  window.setTimeout(() => {
-    try {
-      tailDelay.disconnect();
-    } catch {
-      // ignore errors during tail node cleanup
-    }
-    try {
-      tailFeedback.disconnect();
-    } catch {
-      // ignore errors during tail node cleanup
-    }
-    try {
-      tailLP.disconnect();
-    } catch {
-      // ignore errors during tail node cleanup
-    }
-    try {
-      tailGain.disconnect();
-    } catch {
-      // ignore errors during tail node cleanup
-    }
-  }, cleanupMs);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1044,6 +1208,332 @@ export function fadeAndCleanupLiveAudio(
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Small 808-style instrument helpers integrated with existing scheduling.
+ *
+ * These helpers are intentionally lightweight and use short-lived oscillators/noise
+ * for percussive hits (kick/snare/hat). For bass/sub content we delegate to
+ * `playRichTone()` using a conservative `VoiceProfile`.
+ *
+ * They are safe to call from `loopCircleAudio` and swallow internal errors so
+ * scheduling remains robust.
+ */
+/**
+ * Enqueue a single glow flash aligned with a percussion hit's audio start time.
+ * Percussion notes are single-voice (no detuned stack like playRichTone), so this
+ * is the only glow notification for the note — nothing else flashes for it.
+ */
+function notifyGlowScheduled(
+  audioCtx: AudioContext,
+  circle: SVGCircleElement,
+  startTime: number
+): void {
+  try {
+    const cid = circle?.getAttribute?.('data-circle-id');
+    if (!cid) return;
+    const glow = getGlowController();
+    if (!glow) return;
+    glow.setAudioContext?.(audioCtx);
+    glow.enqueueScheduled?.(cid, startTime);
+  } catch {
+    // ignore glow notification errors to keep audio scheduling robust
+  }
+}
+
+function play808Kick(
+  audioCtx: AudioContext,
+  freqBase: number,
+  startTime: number,
+  dashMs: number,
+  circle: SVGCircleElement
+) {
+  try {
+    const start = Math.max(audioCtx.currentTime, startTime);
+    notifyGlowScheduled(audioCtx, circle, start);
+    const pitchStart = Math.max(60, freqBase * 1.6);
+    const pitchEnd = Math.max(30, freqBase * 0.4);
+    const dur = Math.max(0.14, Math.min(0.9, dashMs / 1000));
+    const pitchDropTime = Math.max(0.06, dur * 0.28);
+
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    try {
+      osc.frequency.setValueAtTime(pitchStart, start);
+      osc.frequency.exponentialRampToValueAtTime(
+        pitchEnd,
+        start + pitchDropTime
+      );
+    } catch {
+      try {
+        osc.frequency.value = pitchStart;
+      } catch {}
+    }
+
+    const g = audioCtx.createGain();
+    try {
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(1.0, start + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    } catch {
+      g.gain.value = 0.75;
+      window.setTimeout(
+        () => {
+          try {
+            g.gain.value = 0;
+          } catch {}
+        },
+        Math.round(dur * 1000)
+      );
+    }
+
+    // optional sub oscillator for weight
+    const sub = audioCtx.createOscillator();
+    sub.type = 'sine';
+    try {
+      sub.frequency.setValueAtTime(Math.max(25, pitchEnd / 2), start);
+    } catch {
+      try {
+        sub.frequency.value = Math.max(25, pitchEnd / 2);
+      } catch {}
+    }
+    const subG = audioCtx.createGain();
+    subG.gain.value = 0.18;
+
+    // mild waveshaper
+    let shaper: WaveShaperNode | null = null;
+    try {
+      shaper = audioCtx.createWaveShaper();
+      const n = 1024;
+      const curve = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        curve[i] = Math.tanh((i / (n - 1)) * 3 * 2 - 3);
+      }
+      shaper.curve = curve;
+      shaper.oversample = '2x';
+    } catch {
+      shaper = null;
+    }
+
+    try {
+      osc.connect(g);
+      sub.connect(subG);
+      subG.connect(g);
+      if (shaper) {
+        g.connect(shaper);
+        shaper.connect(getMasterOutput(audioCtx));
+      } else {
+        g.connect(getMasterOutput(audioCtx));
+      }
+    } catch {
+      // best-effort connections
+    }
+
+    try {
+      osc.start(start);
+      sub.start(start);
+      const stopAt = start + dur + 0.06;
+      osc.stop(stopAt);
+      sub.stop(stopAt);
+    } catch {
+      try {
+        osc.start();
+        sub.start();
+        osc.stop(audioCtx.currentTime + dur + 0.06);
+        sub.stop(audioCtx.currentTime + dur + 0.06);
+      } catch {
+        // ignore
+      }
+    }
+
+    // small click accent
+    try {
+      const click = audioCtx.createOscillator();
+      click.type = 'square';
+      const clickG = audioCtx.createGain();
+      clickG.gain.setValueAtTime(0.0001, start);
+      clickG.gain.linearRampToValueAtTime(0.4, start + 0.006);
+      clickG.gain.linearRampToValueAtTime(0.0001, start + 0.02);
+      click.frequency.value = 1200 + Math.random() * 200;
+      click.connect(clickG);
+      clickG.connect(getMasterOutput(audioCtx));
+      click.start(start);
+      click.stop(start + 0.025);
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      addActiveOscillator(circle, osc, g, 1.0);
+    } catch {
+      /* ignore */
+    }
+  } catch {
+    /* swallow errors */
+  }
+}
+
+function play808Snare(
+  audioCtx: AudioContext,
+  startTime: number,
+  dashMs: number,
+  circle: SVGCircleElement
+) {
+  try {
+    const start = Math.max(audioCtx.currentTime, startTime);
+    notifyGlowScheduled(audioCtx, circle, start);
+    const dur = Math.max(0.06, Math.min(0.5, dashMs / 1000));
+
+    const bufSize = Math.floor((audioCtx.sampleRate || 44100) * dur);
+    const buf = audioCtx.createBuffer(
+      1,
+      Math.max(1, bufSize),
+      audioCtx.sampleRate || 44100
+    );
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < buf.length; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-6 * (i / buf.length));
+    }
+
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+
+    const bp = audioCtx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 3500 + Math.random() * 1200;
+    bp.Q.value = 0.7;
+
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    try {
+      g.gain.linearRampToValueAtTime(1.0, start + 0.005);
+      g.gain.linearRampToValueAtTime(0.0001, start + dur);
+    } catch {
+      g.gain.value = 0.9;
+      window.setTimeout(
+        () => {
+          try {
+            g.gain.value = 0;
+          } catch {}
+        },
+        Math.round(dur * 1000)
+      );
+    }
+
+    try {
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(getMasterOutput(audioCtx));
+    } catch {}
+    try {
+      src.start(start);
+      src.stop(start + dur + 0.02);
+    } catch {
+      try {
+        src.start();
+        src.stop(audioCtx.currentTime + dur + 0.02);
+      } catch {}
+    }
+
+    // tonal body
+    try {
+      const tone = audioCtx.createOscillator();
+      tone.type = 'triangle';
+      tone.frequency.value = 160 + Math.random() * 80;
+      const tg = audioCtx.createGain();
+      tg.gain.setValueAtTime(0.0001, start);
+      tg.gain.linearRampToValueAtTime(0.6, start + 0.006);
+      tg.gain.linearRampToValueAtTime(0.0001, start + Math.min(0.22, dur));
+      tone.connect(tg);
+      tg.connect(getMasterOutput(audioCtx));
+      tone.start(start);
+      tone.stop(start + Math.min(0.22, dur) + 0.03);
+    } catch {
+      /* ignore */
+    }
+  } catch {
+    /* swallow errors */
+  }
+}
+
+function play808Hat(
+  audioCtx: AudioContext,
+  startTime: number,
+  dashMs: number,
+  circle: SVGCircleElement
+) {
+  try {
+    const start = Math.max(audioCtx.currentTime, startTime);
+    notifyGlowScheduled(audioCtx, circle, start);
+    const dur = Math.max(0.01, Math.min(0.08, dashMs / 1000));
+    const sr = audioCtx.sampleRate || 44100;
+    const size = Math.max(1, Math.floor(sr * dur));
+    const buf = audioCtx.createBuffer(1, size, sr);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < size; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.exp(-10 * (i / size));
+    }
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    const hp = audioCtx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 6000 + Math.random() * 5000;
+    hp.Q.value = 0.4;
+    const g = audioCtx.createGain();
+    try {
+      g.gain.setValueAtTime(1.0, start);
+      g.gain.linearRampToValueAtTime(0.0001, start + dur);
+    } catch {
+      g.gain.value = 0.9;
+    }
+    try {
+      src.connect(hp);
+      hp.connect(g);
+      g.connect(getMasterOutput(audioCtx));
+    } catch {}
+    try {
+      src.start(start);
+      src.stop(start + dur + 0.02);
+    } catch {}
+  } catch {
+    /* swallow */
+  }
+}
+
+function play808Bass(
+  audioCtx: AudioContext,
+  freq: number,
+  pan: number,
+  duration: number,
+  startTime: number,
+  rng: () => number,
+  circle: SVGCircleElement,
+  analysis: ReturnType<typeof analyzeSegments>
+) {
+  try {
+    const subProfile: VoiceProfile = {
+      spectral: 0.15,
+      texture: 0.25,
+      motion: 0.35,
+      space: 0.05,
+      presetName: '808-sub',
+    };
+    playRichTone(
+      audioCtx,
+      freq,
+      pan,
+      duration,
+      1 - (circle.getBoundingClientRect().top / window.innerHeight || 0),
+      startTime,
+      rng,
+      circle,
+      analysis,
+      subProfile
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
  * Convert a circle's stroke-dasharray into a sequence of segments and schedule looping playback.
  * Scheduling info (scheduledUntil / loopTimeout) is stored in the state map.
  */
@@ -1088,7 +1578,7 @@ export function loopCircleAudio(
     /* ignore DOM write failures */
   }
   const yNorm = Math.max(0, Math.min(1, y / Math.max(1, window.innerHeight)));
-  const yFactor = 1 - yNorm;
+  const _yFactor = 1 - yNorm;
 
   // Use circle position to derive a musical transpose (reduced range) and ignore octave bias:
   // - x maps to a semitone transpose roughly in [-4..+4] (reduced from [-6..+6])
@@ -1159,17 +1649,65 @@ export function loopCircleAudio(
             /* ignore debug failures */
           }
 
-          playRichTone(
-            audioCtx,
-            freq,
-            pan,
-            dur,
-            yFactor,
-            t,
-            rng,
-            circle,
-            analysis
-          );
+          // Map dash duration to 808-style instruments. Short dashes -> hats, mid -> snare,
+          // long dashes -> kick or bass based on circle X position. This provides a simple
+          // instrument mapping layer on top of existing melodic scheduling.
+          try {
+            const durMs = dur * 1000;
+            const pos = getPos(circle) ?? { x: 0, y: 0 };
+            const cx = pos.x ?? 0;
+            if (dur < 0.08) {
+              // hi-hat
+              try {
+                play808Hat(audioCtx, t, durMs, circle);
+              } catch {
+                /* ignore per-instrument errors */
+              }
+            } else if (dur < 0.25) {
+              // snare / clap region
+              try {
+                play808Snare(audioCtx, t, durMs, circle);
+              } catch {
+                /* ignore */
+              }
+            } else {
+              // longer notes: choose kick (left side) vs bass (right side)
+              try {
+                const screenW = window.innerWidth || 0;
+                if (cx < screenW * 0.5) {
+                  // kick
+                  play808Kick(audioCtx, freq, t, durMs, circle);
+                } else {
+                  // bass: delegate to play808Bass
+                  play808Bass(
+                    audioCtx,
+                    freq,
+                    pan,
+                    dur,
+                    t,
+                    rng,
+                    circle,
+                    analysis
+                  );
+                }
+              } catch {
+                /* ignore instrument selection errors */
+              }
+            }
+          } catch (err) {
+            // ignore scheduling errors but surface a debug message
+            try {
+              console.warn('[loopCircleAudio] scheduling error', {
+                err,
+                circle,
+                freq,
+                t,
+                dur,
+              });
+            } catch {
+              /* ignore debug failures */
+            }
+          }
 
           // NOTE: Event dispatch moved to `playRichTone` so UI receives synth-derived intensity.
         } catch (err) {
