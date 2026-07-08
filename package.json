@@ -7,6 +7,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --manifest-path rust/Cargo.toml && cp rust/target/wasm32-unknown-unknown/release/engine.wasm js/engine/engine.wasm",
     "lint": "eslint \"js/**/*.{ts,js}\"",
     "lint:fix": "eslint \"js/**/*.{ts,js}\" --fix",
     "format": "prettier --write \"**/*.{ts,js,json,md,css,html}\"",

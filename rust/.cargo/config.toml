@@ -1,0 +1,4 @@
+# SIMD is a build flag only: LLVM auto-vectorizes the scalar DSP.
+# Scoped to the wasm target so native `cargo test` builds are unaffected.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
