@@ -53,14 +53,6 @@ impl Engine {
         }
     }
 
-    fn next_rand(&mut self) -> f32 {
-        self.rng_state = self
-            .rng_state
-            .wrapping_mul(1664525)
-            .wrapping_add(1013904223);
-        (self.rng_state >> 8) as f32 / 16_777_216.0
-    }
-
     /// Steal order: free voice → deepest-in-release → oldest.
     fn alloc_voice(&mut self) -> usize {
         let cap = self.cap.min(MAX_VOICES);
@@ -106,8 +98,11 @@ impl Engine {
         space: f32,
     ) {
         let idx = self.alloc_voice();
+        // Borrow (not move) the LCG state so we can persist however many draws
+        // this note consumed; advancing by a fixed step would leave the next
+        // note a one-step-shifted view of the same stream.
         let mut state = self.rng_state;
-        let mut rng = move || {
+        let mut rng = || {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             (state >> 8) as f32 / 16_777_216.0
         };
@@ -125,8 +120,9 @@ impl Engine {
             space,
             &mut rng,
         );
-        // Advance the shared RNG so consecutive notes differ.
-        self.next_rand();
+        // Persist the draws this note actually consumed so the next note gets an
+        // independent sub-sequence, not a one-step-shifted view.
+        self.rng_state = state;
     }
 
     pub fn set_drone(&mut self, freq: f32, bright: f32, level: f32) {
@@ -250,6 +246,23 @@ pub extern "C" fn process() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::voice::NUM_TABLES;
+
+    /// A phase that makes wrap() round to exactly 1.0f32 (tiny negatives, which
+    /// phase modulation produces) must not index past the guard on the last
+    /// morph table. Without the clamp in Tables::lookup this panics (OOB read),
+    /// which under panic=abort permanently kills the worklet audio thread.
+    #[test]
+    fn wavetable_lookup_survives_phase_wrap_to_one() {
+        let tables = Tables::new();
+        let last = (NUM_TABLES - 1) as f32;
+        for &ph in &[-1.0e-8f32, -2.0e-8, -2.5e-8, -1.0e-9, -0.0] {
+            let v = tables.morph(last, ph);
+            assert!(v.is_finite(), "morph({last}, {ph}) not finite: {v}");
+        }
+        // Ordinary phase still resolves.
+        assert!(tables.morph(last, 0.5).is_finite());
+    }
 
     /// Render 1s containing every note kind plus the drone; the output must
     /// be non-silent, finite everywhere, and stay under full scale.

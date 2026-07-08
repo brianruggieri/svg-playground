@@ -143,6 +143,22 @@ export function setDrone(options: DroneOptions): void {
 }
 
 /**
+ * Tear down the worklet engine and reset the module singleton so a later
+ * `initAudioEngine` re-inits cleanly against its own context. If init is still
+ * in flight, dispose once it resolves.
+ */
+export function disposeAudioEngine(): void {
+  if (engine) {
+    engine.dispose();
+  } else if (engineInitPromise) {
+    // Init still in flight: dispose the handle once it resolves.
+    void engineInitPromise.then((handle) => handle.dispose()).catch(() => {});
+  }
+  engine = null;
+  engineInitPromise = null;
+}
+
+/**
  * Flash the glow ring for a circle when its note becomes audible, aligning
  * the DOM update with the audio clock. One dispatch per scheduled note —
  * percussion included.

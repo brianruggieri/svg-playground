@@ -18,6 +18,7 @@ import {
   initAudioEngine,
   loopCircleAudio,
   setDrone,
+  disposeAudioEngine,
 } from './audio';
 import { createCircleAt, emotionalExit } from './circles';
 import { initGlow } from './glow';
@@ -465,6 +466,9 @@ export function init(
   // Return API: destroy handler + useful helpers
   function destroy() {
     setDrone({ on: false });
+    // Disconnect the worklet node and reset the engine singleton so a later
+    // mount re-inits against its own context instead of the stale one.
+    disposeAudioEngine();
 
     svgEl.removeEventListener('pointerdown', onPointerDown);
     window.removeEventListener('pointerup', onPointerUp);

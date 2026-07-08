@@ -81,7 +81,11 @@ impl Tables {
     #[inline]
     fn lookup(&self, table: usize, phase: f32) -> f32 {
         let p = wrap(phase) * TABLE_SIZE as f32;
-        let i = p as usize; // 0..TABLE_SIZE-1 after wrap
+        // wrap() can round to exactly 1.0 for tiny negative phases (f32), which
+        // would make i == TABLE_SIZE and read past the guard sample. Clamp so
+        // the last table stays in bounds; frac then ≈1.0 reads the guard
+        // (== table[0]), i.e. correct wraparound.
+        let i = (p as usize).min(TABLE_SIZE - 1);
         let frac = p - i as f32;
         let base = table * (TABLE_SIZE + 1) + i;
         let a = self.data[base];
