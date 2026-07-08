@@ -230,13 +230,14 @@ export function init(
   }
 
   // Toggle debug overlay with the 'D' key (case-insensitive)
-  document.addEventListener('keydown', (ev) => {
+  function onDebugKeyDown(ev: KeyboardEvent) {
     if (ev.code === 'KeyD') {
       const next = !debugMode;
       setDebugMode(next);
       glow.setDebugPanelEnabled(next);
     }
-  });
+  }
+  document.addEventListener('keydown', onDebugKeyDown);
 
   // Ensure audio starts on first user gesture (some browsers require resume)
   function ensureAudioStarted() {
@@ -477,6 +478,7 @@ export function init(
 
     document.removeEventListener('keydown', onKeyDown);
     document.removeEventListener('keyup', onKeyUp);
+    document.removeEventListener('keydown', onDebugKeyDown);
 
     clearBtnEl.removeEventListener('click', onClearClick);
 
