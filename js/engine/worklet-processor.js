@@ -46,7 +46,32 @@ class SvgPlaygroundEngineProcessor extends AudioWorkletProcessor {
     this.wasm = null;
     this.outL = null;
     this.outR = null;
-    this.queue = []; // sorted ascending by .when (AudioContext seconds)
+
+    // Preallocated note pool — no allocation, splice, or shift on the audio
+    // thread. Each slot is a reused plain object; enqueue copies fields in,
+    // process() scans for due notes and frees the slots. A full pool drops the
+    // note (a bounded queue is the real-time-safe stance). NOTE_CAP covers the
+    // ~0.1 s lookahead across every looping circle with wide margin.
+    this.NOTE_CAP = 512;
+    this.notes = new Array(this.NOTE_CAP);
+    for (let i = 0; i < this.NOTE_CAP; i++) {
+      this.notes[i] = {
+        active: false,
+        when: 0,
+        kind: 0,
+        freq: 0,
+        dur: 0,
+        vel: 0,
+        pan: 0,
+        s: 0,
+        t: 0,
+        m: 0,
+        sp: 0,
+      };
+    }
+    this.noteCount = 0;
+    this.dueIdx = new Int32Array(this.NOTE_CAP); // scratch for offset-ordered drain
+
     this.port.onmessage = (e) => this.handleMessage(e.data);
 
     // The compiled Module arrives via processorOptions rather than a port
@@ -82,10 +107,35 @@ class SvgPlaygroundEngineProcessor extends AudioWorkletProcessor {
   }
 
   enqueue(msg) {
-    const q = this.queue;
-    let i = q.length;
-    while (i > 0 && q[i - 1].when > msg.when) i--;
-    q.splice(i, 0, msg);
+    const slots = this.notes;
+    for (let i = 0; i < this.NOTE_CAP; i++) {
+      const s = slots[i];
+      if (!s.active) {
+        s.active = true;
+        s.when = msg.when;
+        s.kind = msg.kind;
+        s.freq = msg.freq;
+        s.dur = msg.dur;
+        s.vel = msg.vel;
+        s.pan = msg.pan;
+        s.s = msg.s;
+        s.t = msg.t;
+        s.m = msg.m;
+        s.sp = msg.sp;
+        this.noteCount++;
+        return;
+      }
+    }
+    // Pool full: drop the note rather than grow (unbounded growth on the audio
+    // thread is the thing we are avoiding).
+  }
+
+  // Frame offset of a note within the current quantum, clamped to [0, frames).
+  offsetOf(when, frames) {
+    return Math.max(
+      0,
+      Math.min(frames - 1, Math.round((when - currentTime) * sampleRate))
+    );
   }
 
   handleMessage(msg) {
@@ -103,24 +153,44 @@ class SvgPlaygroundEngineProcessor extends AudioWorkletProcessor {
 
     const frames = out[0].length;
     const quantumEnd = currentTime + frames / sampleRate;
-    while (this.queue.length > 0 && this.queue[0].when < quantumEnd) {
-      const n = this.queue.shift();
-      const off = Math.max(
-        0,
-        Math.min(frames - 1, Math.round((n.when - currentTime) * sampleRate))
-      );
-      this.wasm.note_on(
-        off,
-        n.kind,
-        n.freq,
-        n.dur,
-        n.vel,
-        n.pan,
-        n.s,
-        n.t,
-        n.m,
-        n.sp
-      );
+
+    if (this.noteCount > 0) {
+      const slots = this.notes;
+      const due = this.dueIdx;
+      let n = 0;
+      for (let i = 0; i < this.NOTE_CAP; i++) {
+        if (slots[i].active && slots[i].when < quantumEnd) due[n++] = i;
+      }
+      // Insertion-sort due notes by frame offset ascending so earlier onsets
+      // call note_on first and get first pick of voices — a later-in-quantum
+      // onset then cannot steal a voice an earlier onset still needs.
+      for (let a = 1; a < n; a++) {
+        const idx = due[a];
+        const key = this.offsetOf(slots[idx].when, frames);
+        let b = a - 1;
+        while (b >= 0 && this.offsetOf(slots[due[b]].when, frames) > key) {
+          due[b + 1] = due[b];
+          b--;
+        }
+        due[b + 1] = idx;
+      }
+      for (let k = 0; k < n; k++) {
+        const s = slots[due[k]];
+        this.wasm.note_on(
+          this.offsetOf(s.when, frames),
+          s.kind,
+          s.freq,
+          s.dur,
+          s.vel,
+          s.pan,
+          s.s,
+          s.t,
+          s.m,
+          s.sp
+        );
+        s.active = false;
+        this.noteCount--;
+      }
     }
 
     this.wasm.set_drone(
