@@ -41,41 +41,59 @@ class SvgPlaygroundEngineProcessor extends AudioWorkletProcessor {
     ];
   }
 
-  constructor() {
+  constructor(options) {
     super();
     this.wasm = null;
     this.outL = null;
     this.outR = null;
     this.queue = []; // sorted ascending by .when (AudioContext seconds)
     this.port.onmessage = (e) => this.handleMessage(e.data);
+
+    // The compiled Module arrives via processorOptions rather than a port
+    // message: processorOptions are available synchronously here in the
+    // constructor, which an OfflineAudioContext delivers before its first
+    // render quantum (pre-render port messages are not). Any notes passed at
+    // construction (used by the offline smoke) are queued the same way.
+    const opts = (options && options.processorOptions) || {};
+    if (opts.module) {
+      this.instantiate(opts.module, opts.voiceCap);
+    }
+    if (Array.isArray(opts.notes)) {
+      for (const n of opts.notes) this.enqueue(n);
+    }
+  }
+
+  instantiate(module, voiceCap) {
+    try {
+      // Synchronous instantiation: we already hold a compiled Module with no
+      // imports, so there is no async race against offline rendering.
+      const ex = new WebAssembly.Instance(module, {}).exports;
+      ex.init(sampleRate);
+      if (typeof voiceCap === 'number') ex.set_voice_cap(voiceCap);
+      // init() allocates (tables, delay lines) and may grow memory, so the
+      // output views are created only after it returns.
+      this.outL = new Float32Array(ex.memory.buffer, ex.out_l_ptr(), 128);
+      this.outR = new Float32Array(ex.memory.buffer, ex.out_r_ptr(), 128);
+      this.wasm = ex;
+      this.port.postMessage({ type: 'ready' });
+    } catch (err) {
+      this.port.postMessage({ type: 'error', message: String(err) });
+    }
+  }
+
+  enqueue(msg) {
+    const q = this.queue;
+    let i = q.length;
+    while (i > 0 && q[i - 1].when > msg.when) i--;
+    q.splice(i, 0, msg);
   }
 
   handleMessage(msg) {
     if (!msg) return;
     if (msg.type === 'module') {
-      WebAssembly.instantiate(msg.module, {}).then(
-        (instance) => {
-          const ex = instance.exports;
-          ex.init(sampleRate);
-          if (typeof msg.voiceCap === 'number') {
-            ex.set_voice_cap(msg.voiceCap);
-          }
-          // init() allocates (tables, delay lines) and may grow memory, so
-          // the output views are created only after it returns.
-          this.outL = new Float32Array(ex.memory.buffer, ex.out_l_ptr(), 128);
-          this.outR = new Float32Array(ex.memory.buffer, ex.out_r_ptr(), 128);
-          this.wasm = ex;
-          this.port.postMessage({ type: 'ready' });
-        },
-        (err) => {
-          this.port.postMessage({ type: 'error', message: String(err) });
-        }
-      );
+      this.instantiate(msg.module, msg.voiceCap);
     } else if (msg.type === 'noteOn') {
-      const q = this.queue;
-      let i = q.length;
-      while (i > 0 && q[i - 1].when > msg.when) i--;
-      q.splice(i, 0, msg);
+      this.enqueue(msg);
     }
   }
 

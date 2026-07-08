@@ -78,7 +78,36 @@ async function compileWasm(): Promise<WebAssembly.Module> {
   return WebAssembly.compile(bytes);
 }
 
-export async function initEngine(ctx: BaseAudioContext): Promise<EngineHandle> {
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+/** Flatten a NoteOptions object into the number-only message the worklet reads. */
+function flattenNote(o: NoteOptions) {
+  return {
+    type: 'noteOn' as const,
+    when: o.when,
+    kind: KIND_CODE[o.kind],
+    freq: o.freq,
+    dur: o.durSec,
+    vel: clamp01(o.velocity),
+    pan: Math.max(-1, Math.min(1, o.pan)),
+    s: clamp01(o.profile.spectral),
+    t: clamp01(o.profile.texture),
+    m: clamp01(o.profile.motion),
+    sp: clamp01(o.profile.space),
+  };
+}
+
+export interface InitEngineOptions {
+  // Notes handed to the processor at construction. Needed for an
+  // OfflineAudioContext, which does not deliver port messages posted before
+  // startRendering(); realtime callers use noteOn() instead.
+  notes?: NoteOptions[];
+}
+
+export async function initEngine(
+  ctx: BaseAudioContext,
+  opts: InitEngineOptions = {}
+): Promise<EngineHandle> {
   const [module] = await Promise.all([
     compileWasm(),
     ctx.audioWorklet.addModule(
@@ -86,13 +115,22 @@ export async function initEngine(ctx: BaseAudioContext): Promise<EngineHandle> {
     ),
   ]);
 
+  const noteCap = isMobile() ? 12 : 24;
+
+  // The compiled Module (and any offline pre-roll notes) ride in via
+  // processorOptions, which the processor constructor reads synchronously —
+  // an OfflineAudioContext delivers those before its first render quantum,
+  // whereas pre-render port messages are dropped.
   const node = new AudioWorkletNode(ctx, 'svg-playground-engine', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
     outputChannelCount: [2],
+    processorOptions: {
+      module,
+      voiceCap: noteCap,
+      notes: (opts.notes ?? []).map(flattenNote),
+    },
   });
-
-  const noteCap = isMobile() ? 12 : 24;
 
   const ready = new Promise<void>((resolve, reject) => {
     node.port.onmessage = (e: MessageEvent) => {
@@ -103,29 +141,25 @@ export async function initEngine(ctx: BaseAudioContext): Promise<EngineHandle> {
       }
     };
   });
-  node.port.postMessage({ type: 'module', module, voiceCap: noteCap });
-  await ready;
-  node.port.onmessage = null;
 
-  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const isOffline =
+    typeof OfflineAudioContext !== 'undefined' &&
+    ctx instanceof OfflineAudioContext;
+  if (isOffline) {
+    // The 'ready' reply is only pumped during startRendering(), so blocking on
+    // it here would deadlock. The module is already instantiated in the
+    // constructor via processorOptions, so resolve immediately.
+    node.port.onmessage = null;
+  } else {
+    await ready;
+    node.port.onmessage = null;
+  }
 
   return {
     node,
     noteCap,
     noteOn(o: NoteOptions): void {
-      node.port.postMessage({
-        type: 'noteOn',
-        when: o.when,
-        kind: KIND_CODE[o.kind],
-        freq: o.freq,
-        dur: o.durSec,
-        vel: clamp01(o.velocity),
-        pan: Math.max(-1, Math.min(1, o.pan)),
-        s: clamp01(o.profile.spectral),
-        t: clamp01(o.profile.texture),
-        m: clamp01(o.profile.motion),
-        sp: clamp01(o.profile.space),
-      });
+      node.port.postMessage(flattenNote(o));
     },
     setDrone(o: DroneOptions): void {
       const now = ctx.currentTime;

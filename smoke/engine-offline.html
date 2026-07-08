@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>engine offline smoke</title>
+    <!-- Inline favicon so the browser's default /favicon.ico probe can't 404. -->
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <pre id="log">running…</pre>
+    <script type="module">
+      import { initEngine } from '../js/engine/engine.ts';
+
+      const logEl = document.getElementById('log');
+      const lines = [];
+      function log(msg) {
+        lines.push(msg);
+        logEl.textContent = lines.join('\n');
+        // eslint-disable-next-line no-console
+        console.log(msg);
+      }
+
+      // Exposed so an automated driver (Playwright) can await the result.
+      window.__smokeResult = null;
+
+      async function run() {
+        const sr = 48000;
+        const seconds = 0.4;
+        const ctx = new OfflineAudioContext(2, sr * seconds, sr);
+
+        // The note rides in via initEngine's `notes` option: an
+        // OfflineAudioContext drops port messages posted before startRendering,
+        // so noteOn() would never reach the worklet here.
+        const engine = await initEngine(ctx, {
+          notes: [
+            {
+              when: 0.1,
+              freq: 220,
+              durSec: 0.2,
+              velocity: 0.9,
+              pan: 0,
+              kind: 'tone',
+              profile: { spectral: 0.7, texture: 0.3, motion: 0.4, space: 0.2 },
+            },
+          ],
+        });
+        engine.node.connect(ctx.destination);
+
+        const buf = await ctx.startRendering();
+        const l = buf.getChannelData(0);
+        const r = buf.getChannelData(1);
+
+        const sampleAt = (t) => Math.floor(t * sr);
+        function peak(chan, from, to) {
+          let p = 0;
+          for (let i = from; i < to; i++) p = Math.max(p, Math.abs(chan[i]));
+          return p;
+        }
+
+        // Before the note onset (allow a little slack for scheduling): silent.
+        const preL = peak(l, 0, sampleAt(0.09));
+        const preR = peak(r, 0, sampleAt(0.09));
+        // After onset: audible in both channels.
+        const postL = peak(l, sampleAt(0.1), sampleAt(0.3));
+        const postR = peak(r, sampleAt(0.1), sampleAt(0.3));
+
+        log(
+          `pre-onset peak  L=${preL.toExponential(2)} R=${preR.toExponential(2)}`
+        );
+        log(`post-onset peak L=${postL.toFixed(4)} R=${postR.toFixed(4)}`);
+
+        const silentBefore = preL < 1e-4 && preR < 1e-4;
+        const audibleAfter = postL > 0.01 && postR > 0.01;
+        const pass = silentBefore && audibleAfter;
+
+        log(pass ? 'PASS' : 'FAIL');
+        window.__smokeResult = {
+          pass,
+          silentBefore,
+          audibleAfter,
+          preL,
+          preR,
+          postL,
+          postR,
+        };
+      }
+
+      run().catch((err) => {
+        log('FAIL (threw): ' + String(err));
+        window.__smokeResult = { pass: false, error: String(err) };
+      });
+    </script>
+  </body>
+</html>
