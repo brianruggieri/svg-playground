@@ -86,6 +86,7 @@ type GlowState = {
 };
 
 let __activeState: GlowState | null = null;
+let __activeController: GlowController | null = null;
 
 function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
@@ -728,6 +729,7 @@ function initGlowInternal(
   if (__activeState) {
     cleanupGlowState(__activeState);
     __activeState = null;
+    __activeController = null;
   }
 
   const persisted =
@@ -772,15 +774,16 @@ function initGlowInternal(
     state.debugPanel = createDebugPanel(state);
   }
 
-  const destroy = () => {
-    cleanupGlowState(state);
-    if (__activeState === state) {
-      __activeState = null;
-    }
-  };
-
-  return {
-    destroy,
+  const controller: GlowController = {
+    destroy: () => {
+      cleanupGlowState(state);
+      if (__activeState === state) {
+        __activeState = null;
+      }
+      if (__activeController === controller) {
+        __activeController = null;
+      }
+    },
     getConfig: () => ({ ...state.config }),
     applyConfig: (next: Partial<GlowConfig>) => {
       state.config = { ...state.config, ...next };
@@ -803,6 +806,9 @@ function initGlowInternal(
       }
     },
   };
+
+  __activeController = controller;
+  return controller;
 }
 
 export function initGlow(
@@ -817,35 +823,7 @@ export function initGlow(
 }
 
 export function getGlowController(): GlowController | null {
-  if (!__activeState) return null;
-  return {
-    destroy: () => __activeState?.observers?.forEach((o) => o.disconnect()),
-    getConfig: () =>
-      __activeState ? { ...__activeState.config } : { ...DEFAULT_CONFIG },
-    applyConfig: (next: Partial<GlowConfig>) => {
-      if (!__activeState) return;
-      __activeState.config = { ...__activeState.config, ...next };
-      applyFilterConfig(__activeState);
-      persistConfig(__activeState);
-    },
-    flash: (circle: SVGCircleElement, detail?: NoteDetail) => {
-      if (!__activeState) return;
-      flashGlow(__activeState, circle, detail);
-    },
-    setDebugPanelEnabled: (on: boolean) => {
-      if (!__activeState) return;
-      if (on && !__activeState.debugPanel) {
-        __activeState.debugPanel = createDebugPanel(__activeState);
-      } else if (!on && __activeState.debugPanel) {
-        try {
-          __activeState.debugPanel.remove();
-        } catch {
-          // ignore
-        }
-        __activeState.debugPanel = null;
-      }
-    },
-  };
+  return __activeController;
 }
 
 export function flashGlowForCircleId(
