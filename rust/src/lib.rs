@@ -129,6 +129,15 @@ impl Engine {
         self.drone.set_targets(freq, bright, level);
     }
 
+    /// Silence every sounding voice immediately (used by the Clear button).
+    /// The shared delay tail is left to ring out naturally — it decays on its
+    /// own and hard-cutting it would click.
+    pub fn all_notes_off(&mut self) {
+        for v in self.voices.iter_mut() {
+            v.active = false;
+        }
+    }
+
     pub fn process(&mut self) {
         self.out_l = [0.0; QUANTUM];
         self.out_r = [0.0; QUANTUM];
@@ -227,6 +236,11 @@ pub extern "C" fn set_drone(freq: f32, bright: f32, level: f32) {
 }
 
 #[no_mangle]
+pub extern "C" fn all_notes_off() {
+    with_engine(|e| e.all_notes_off());
+}
+
+#[no_mangle]
 pub extern "C" fn out_l_ptr() -> *const f32 {
     with_engine(|e| e.out_l.as_ptr()).unwrap_or(core::ptr::null())
 }
@@ -313,6 +327,26 @@ mod tests {
             }
         }
         assert!(peak_after > 0.005, "note never became audible ({peak_after})");
+    }
+
+    /// all_notes_off silences every voice so the Clear button can cut audio
+    /// that was already scheduled into the engine.
+    #[test]
+    fn all_notes_off_silences_voices() {
+        let mut e = Engine::new(48000.0);
+        for i in 0..6 {
+            e.note_on(0, 0, 200.0 + i as f32 * 20.0, 1.0, 0.9, 0.0, 0.5, 0.5, 0.5, 0.2);
+        }
+        e.process();
+        assert!(e.voices.iter().any(|v| v.active), "notes should be sounding");
+        e.all_notes_off();
+        assert!(
+            e.voices.iter().all(|v| !v.active),
+            "all voices must be silenced"
+        );
+        // A voice buffer that renders after the cut must not resurrect a voice.
+        e.process();
+        assert!(e.voices.iter().all(|v| !v.active), "voices stayed silent");
     }
 
     /// Voice stealing must never exceed the cap and always succeed.

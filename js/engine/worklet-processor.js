@@ -144,6 +144,11 @@ class SvgPlaygroundEngineProcessor extends AudioWorkletProcessor {
       this.instantiate(msg.module, msg.voiceCap);
     } else if (msg.type === 'noteOn') {
       this.enqueue(msg);
+    } else if (msg.type === 'allNotesOff') {
+      // Drop everything still queued in the pool and silence sounding voices.
+      for (let i = 0; i < this.NOTE_CAP; i++) this.notes[i].active = false;
+      this.noteCount = 0;
+      if (this.wasm) this.wasm.all_notes_off();
     }
   }
 

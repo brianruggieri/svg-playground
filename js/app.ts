@@ -18,6 +18,7 @@ import {
   initAudioEngine,
   loopCircleAudio,
   setDrone,
+  stopAllAudio,
   disposeAudioEngine,
 } from './audio';
 import { createCircleAt, emotionalExit } from './circles';
@@ -435,6 +436,9 @@ export function init(
   // Clear button handler
   function onClearClick() {
     setDrone({ on: false });
+    // Cut audio already scheduled into the worklet (up to one rotation ahead),
+    // not just future scheduler ticks — otherwise long circles keep sounding.
+    stopAllAudio();
     const circles = Array.from(svgEl.querySelectorAll('circle'));
     for (const c of circles) {
       try {

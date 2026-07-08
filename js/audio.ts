@@ -151,6 +151,15 @@ export function setDrone(options: DroneOptions): void {
 }
 
 /**
+ * Silence everything immediately: drop notes already scheduled into the worklet
+ * (the scheduler runs up to one rotation ahead) and cut sounding voices. Used
+ * by the Clear button so long circles don't keep playing after clear.
+ */
+export function stopAllAudio(): void {
+  engine?.allNotesOff();
+}
+
+/**
  * Tear down the worklet engine and reset the module singleton so a later
  * `initAudioEngine` re-inits cleanly against its own context. If init is still
  * in flight, dispose once it resolves.
