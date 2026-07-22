@@ -28,6 +28,8 @@
         fill: none;
         stroke: rgba(255, 255, 255, 0.15);
         stroke-width: 1.5;
+        transform-box: fill-box;
+        transform-origin: center;
       }
       .spinner {
         fill: none;
@@ -71,9 +73,14 @@
       .glow-ring.playing {
         stroke-opacity: 0.95;
       }
+      /* --spin-scale carries the vertical-drag size so the rotation animation
+         doesn't clobber it (a CSS animation replaces the whole transform). */
       @keyframes spin {
+        from {
+          transform: rotate(0deg) scale(var(--spin-scale, 1));
+        }
         to {
-          transform: rotate(-360deg);
+          transform: rotate(-360deg) scale(var(--spin-scale, 1));
         }
       }
 

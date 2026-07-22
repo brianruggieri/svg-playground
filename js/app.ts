@@ -13,6 +13,7 @@
  */
 
 import { buildDashArray, toSvgPoint, SegmentInput } from './utils';
+import { DRAG_PX_PER_OCTAVE, SCALE_MIN, SCALE_MAX } from './constants';
 import {
   createAudioContext,
   initAudioEngine,
@@ -25,6 +26,7 @@ import { createCircleAt, emotionalExit } from './circles';
 import { initGlow } from './glow';
 import {
   setSegments,
+  setScale,
   setHoldDuration,
   getLoopTimeout,
   clearLoopTimeout,
@@ -93,6 +95,8 @@ export function init(
 
   // Instance local state
   let currentCircle: SVGCircleElement | null = null;
+  let currentGhost: SVGCircleElement | null = null;
+  let dragAnchorY: number | null = null; // clientY at pointerdown, for vertical-drag scaling
   let holdStart: number | null = null;
   let lastSegmentStart: number | null = null;
   let isSpaceDown = false;
@@ -280,6 +284,8 @@ export function init(
       rafId = null;
     }
     currentCircle = null;
+    currentGhost = null;
+    dragAnchorY = null;
     segments = [];
     isSpaceDown = false;
     holdStart = null;
@@ -354,6 +360,14 @@ export function init(
     const loc = toSvgPoint(svgEl, e);
     const created = createCircleAt(svgEl, loc);
     currentCircle = created as SVGCircleElement;
+    // The ghost outline shares the circle's id; scale it alongside the spinner.
+    const id = currentCircle.getAttribute('data-circle-id');
+    currentGhost = id
+      ? (svgEl.querySelector(
+          `circle.ghost[data-circle-id="${id}"]`
+        ) as SVGCircleElement | null)
+      : null;
+    dragAnchorY = e.clientY;
 
     if (debugMode && currentCircle) {
       createOverlayForCircle(
@@ -380,6 +394,25 @@ export function init(
 
   function onPointerCancel() {
     abortCurrentRecording();
+  }
+
+  // Vertical drag = pitch control: dragging up grows the circle and lowers its
+  // pitch (big resonator = deep bass); dragging down shrinks and raises it.
+  // Applied as a CSS scale (the --spin-scale var so the spin animation keeps
+  // it) — the dash/audio geometry stays in the fixed CIRCLE_CIRCUMFERENCE space.
+  function onPointerMove(e: PointerEvent) {
+    if (!currentCircle || dragAnchorY == null) return;
+    const dy = dragAnchorY - e.clientY; // up is positive
+    const scale = Math.max(
+      SCALE_MIN,
+      Math.min(SCALE_MAX, Math.pow(2, dy / DRAG_PX_PER_OCTAVE))
+    );
+    setScale(currentCircle, scale);
+    for (const el of [currentCircle, currentGhost]) {
+      if (!el) continue;
+      el.style.setProperty('--spin-scale', String(scale));
+      el.style.transform = `scale(${scale})`;
+    }
   }
 
   // Keyboard handlers for Space to start/stop dash segments
@@ -445,6 +478,8 @@ export function init(
   svgEl.addEventListener('pointerdown', onPointerDown);
   // pointerup might happen anywhere; listen on window to ensure we catch it
   window.addEventListener('pointerup', onPointerUp);
+  // Track vertical drag on the window so scaling continues across the canvas.
+  window.addEventListener('pointermove', onPointerMove);
   svgEl.addEventListener('pointercancel', onPointerCancel);
   svgEl.addEventListener('pointerleave', onPointerUp);
 
@@ -461,6 +496,7 @@ export function init(
 
     svgEl.removeEventListener('pointerdown', onPointerDown);
     window.removeEventListener('pointerup', onPointerUp);
+    window.removeEventListener('pointermove', onPointerMove);
     svgEl.removeEventListener('pointercancel', onPointerCancel);
     svgEl.removeEventListener('pointerleave', onPointerUp);
 

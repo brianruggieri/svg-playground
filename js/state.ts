@@ -29,6 +29,7 @@ export type CircleState = {
   segments?: SegmentInput[]; // recorded segments during hold
   holdDuration?: number; // milliseconds
   scheduledUntil?: number | null; // audioContext.currentTime up to which we've scheduled
+  scale?: number; // vertical-drag size multiplier (1 = default); bigger = lower pitch
 };
 
 /** WeakMap storing the state per circle element. */
@@ -56,6 +57,7 @@ export function ensureCircleState(
     segments: init?.segments ?? [],
     holdDuration: init?.holdDuration,
     scheduledUntil: init?.scheduledUntil ?? null,
+    scale: init?.scale ?? 1,
   };
   stateMap.set(circle, newState);
   return newState;
@@ -91,6 +93,17 @@ export function setRng(circle: SVGCircleElement, rng: () => number): void {
 
 export function getRng(circle: SVGCircleElement): (() => number) | undefined {
   return stateMap.get(circle)?.rng;
+}
+
+/* ----------------------- Scale (vertical-drag size) ----------------------- */
+
+export function setScale(circle: SVGCircleElement, scale: number): void {
+  const st = ensureCircleState(circle);
+  st.scale = scale;
+}
+
+export function getScale(circle: SVGCircleElement): number {
+  return stateMap.get(circle)?.scale ?? 1;
 }
 
 /* ----------------------- Segments & Hold ----------------------- */
