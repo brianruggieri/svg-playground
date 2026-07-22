@@ -18,6 +18,7 @@ import { analyzeSegments, chooseScale, SegmentLength } from './utils';
 import {
   getPos,
   getRng,
+  getScale,
   setLoopTimeout,
   setScheduledUntil,
   getScheduledUntil,
@@ -224,7 +225,11 @@ function derivePlacement(circle: SVGCircleElement): {
   // x maps to a semitone transpose roughly in [-4..+4]; no octave bias so
   // pitches stay lower on average.
   const transposeSemis = Math.round((x / window.innerWidth - 0.5) * 8);
-  const semitoneFactor = Math.pow(2, transposeSemis / 12);
+  // Vertical-drag size sets pitch: a bigger circle rings lower, so pitch scales
+  // by 1/size (2x size = down an octave).
+  const scale = getScale(circle);
+  const semitoneFactor =
+    Math.pow(2, transposeSemis / 12) / (scale > 0 ? scale : 1);
   return { pan, yFactor, semitoneFactor };
 }
 

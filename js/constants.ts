@@ -9,6 +9,12 @@ export const LOOP_SCHEDULE_AHEAD_SEC = 0.1;
 // This should be less than LOOP_SCHEDULE_AHEAD_SEC * 1000 to avoid gaps.
 export const SCHEDULER_INTERVAL_MS = 50;
 
+// Vertical-drag pitch/size control (drag up = bigger circle + lower pitch).
+// One octave of size (a 2x/0.5x scale) per this many pixels of vertical drag.
+export const DRAG_PX_PER_OCTAVE = 220;
+export const SCALE_MIN = 0.4;
+export const SCALE_MAX = 2.4;
+
 export type ScaleName = 'pentatonic' | 'major' | 'minor';
 
 export const SCALES: Record<ScaleName, number[]> = {
